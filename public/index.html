@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>멘코 - 마음을 듣는 AI</title>
+<style>
+  :root {
+    --bg: #1b1b24;
+    --idle-1: #6c8cff;
+    --idle-2: #8f6cff;
+    --listen-1: #ff6c8c;
+    --listen-2: #ff8f6c;
+    --speak-1: #6cffb0;
+    --speak-2: #6cd4ff;
+    --text: #f2f2f7;
+    --muted: #9a9ab0;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 32px;
+    background: radial-gradient(circle at 50% 40%, #23232f 0%, var(--bg) 70%);
+    font-family: -apple-system, BlinkMacSystemFont, "Pretendard", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+    color: var(--text);
+    overflow: hidden;
+  }
+
+  .title {
+    font-size: 22px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--text);
+    opacity: 0.9;
+  }
+
+  .affiliation {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: -20px;
+  }
+
+  .affiliation img {
+    height: 20px;
+    width: auto;
+  }
+
+  .affiliation span {
+    font-size: 13px;
+    color: var(--muted);
+  }
+
+  .status {
+    min-height: 24px;
+    font-size: 15px;
+    color: var(--muted);
+    text-align: center;
+    max-width: 320px;
+    line-height: 1.5;
+  }
+
+  .mic-wrap {
+    position: relative;
+    width: 220px;
+    height: 220px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .ring {
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--idle-1), var(--idle-2));
+    opacity: 0.25;
+    filter: blur(4px);
+    transition: background 0.4s ease;
+  }
+
+  #micButton {
+    --mic-level: 0;
+    position: relative;
+    width: 180px;
+    height: 180px;
+    border-radius: 50%;
+    border: none;
+    cursor: pointer;
+    background: linear-gradient(135deg, var(--idle-1), var(--idle-2));
+    box-shadow: 0 10px 40px rgba(108, 140, 255, 0.35);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.4s ease, box-shadow 0.4s ease, transform 0.15s ease;
+  }
+
+  #micButton:active {
+    transform: scale(0.97);
+  }
+
+  #micButton svg {
+    width: 64px;
+    height: 64px;
+    fill: white;
+  }
+
+  /* listening state */
+  body.listening .ring {
+    background: linear-gradient(135deg, var(--listen-1), var(--listen-2));
+    animation: pulse 1.4s ease-out infinite;
+  }
+  body.listening #micButton {
+    background: linear-gradient(135deg, var(--listen-1), var(--listen-2));
+    box-shadow: 0 10px 40px rgba(255, 108, 140, 0.45);
+    transform: scale(calc(1 + var(--mic-level, 0) * 0.12));
+    transition: transform 0.05s linear;
+  }
+
+  /* connecting state */
+  body.connecting #micButton {
+    background: linear-gradient(135deg, #666680, #444459);
+    box-shadow: 0 10px 40px rgba(80, 80, 100, 0.35);
+    animation: breathe 1.2s ease-in-out infinite;
+  }
+
+  /* speaking state */
+  body.speaking .ring {
+    background: linear-gradient(135deg, var(--speak-1), var(--speak-2));
+    animation: pulse 1s ease-out infinite;
+  }
+  body.speaking #micButton {
+    background: linear-gradient(135deg, var(--speak-1), var(--speak-2));
+    box-shadow: 0 10px 40px rgba(108, 212, 255, 0.45);
+  }
+
+  @keyframes pulse {
+    0% { transform: scale(1); opacity: 0.35; }
+    70% { transform: scale(1.45); opacity: 0; }
+    100% { transform: scale(1.45); opacity: 0; }
+  }
+
+  @keyframes breathe {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+  }
+</style>
+</head>
+<body>
+  <div class="title">MENCO</div>
+  <div class="affiliation">
+    <img src="soongsil-logo.png" alt="숭실대학교 로고" />
+    <span>숭실대학교 커리어학습코칭 연구소</span>
+  </div>
+
+  <div class="mic-wrap">
+    <div class="ring"></div>
+    <button id="micButton" aria-label="마이크 버튼">
+      <svg viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>
+    </button>
+  </div>
+
+  <div class="status" id="status">버튼을 누르고 멘탈 대화를 시작해 보세요</div>
+
+  <script src="app.js"></script>
+</body>
+</html>

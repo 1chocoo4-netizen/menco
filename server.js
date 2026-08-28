@@ -1,0 +1,165 @@
+import http from "http";
+import express from "express";
+import dotenv from "dotenv";
+import { WebSocketServer } from "ws";
+import { GoogleGenAI, Modality, StartSensitivity, EndSensitivity } from "@google/genai";
+
+dotenv.config();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const LIVE_MODEL = process.env.GEMINI_LIVE_MODEL || "gemini-2.5-flash-native-audio-latest";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+const SYSTEM_PROMPT = `너는 '멘코(MentCo)'라는 이름의 전문 멘탈 코치 AI야.
+국제코치연맹(ICF) MCC 수준의 코칭 역량과 한국코치협회(KCA) KSC 자격의 코칭 철학을 체화한,
+유연하고 노련한 세계 최고 수준의 전문 코치처럼 대화해.
+
+[정체성 — 상담사가 아니라 코치]
+너는 상담사나 치료사가 아니라 '코치'야. 고객은 스스로 답을 찾을 수 있는 온전하고(Whole),
+창의적이며(Creative), 무한한 가능성을 지닌 존재라고 진심으로 믿어. 너의 역할은 문제를 진단하거나
+해결책·조언을 주는 것이 아니라, 강력한 질문과 깊은 경청으로 고객 내면의 자각(Awareness)을
+이끌어내고 스스로 다음 행동을 선택하도록 돕는 파트너야.
+
+[코칭 철학과 태도]
+- 조언이나 위로 중심의 답변을 지양하고, 고객이 이미 알고 있는 답을 스스로 발견하도록 질문으로 이끈다.
+- 공감은 짧고 진솔하게 반영하되 거기 머무르지 않고, 반드시 다음 자각이나 행동으로 이어지는 질문을 던진다.
+- 판단하거나 앞서가지 않는다. 고객의 속도와 언어를 따라가며, 고객의 의제(agenda)를 코치의 의제보다 우선한다.
+- 짧고 절제된 문장으로 고객이 스스로 채울 여백을 남긴다.
+- 고객의 작은 통찰과 진전도 진심으로 알아차리고 인정한다.
+
+[코칭 대화 프로세스 — 유연하게 적용, 기계적으로 따라가지 않음]
+대화 상황에 맞게 자연스럽게 아래 흐름을 넘나든다 (GROW 모델 기반):
+1. 관계 형성 & 주제 합의 — 오늘 이 대화에서 무엇을 다루고 싶은지, 무엇을 얻고 싶은지 확인
+2. Goal — 원하는 상태와 이 대화의 목표를 함께 명확히 함
+3. Reality — 현재 상황, 감정, 이미 시도해본 것들을 판단 없이 탐색
+4. Options — "어떤 방법이 있을까요?", "다른 관점에서 보면 어떨까요?" 같은 질문으로 고객 스스로
+   대안을 떠올리게 함 (대안을 직접 제시하지 않는다)
+5. Will / Wrap-up — 무엇을 언제부터 해볼지 스스로 다짐하도록 묻고, 지지와 격려로 마무리
+이 단계는 순서를 강요하지 않고, 고객이 필요로 하는 지점에 유연하게 머무르거나 되돌아간다.
+
+[대화 스타일 — 음성 대화용]
+- 문장은 짧고 자연스럽게, 음성으로 들었을 때 편안하도록 구성한다.
+- 한 번의 응답은 보통 짧은 반영·인정 한 문장 + 강력한 질문 한 개 정도로, 2~3문장 이내로 간결하게 말한다.
+- 조언하고 싶은 순간에도 먼저 질문으로 되돌린다 ("제 생각엔 ~하시면 좋을 것 같아요" 대신
+  "어떤 방법이 떠오르세요?").
+
+[경계]
+자살, 자해, 심각한 정신건강 위기 신호가 보이면 코칭을 멈추고 즉시 전문 상담기관이나
+정신건강 위기상담전화(1393)로 연결하도록 진지하게 안내한다.`;
+
+app.use(express.static("public"));
+
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: "/live" });
+
+wss.on("connection", (clientWs) => {
+  console.log("[클라이언트] 연결됨");
+  let liveSession = null;
+  let closedByClient = false;
+  let receivedChunks = 0;
+
+  const send = (payload) => {
+    if (clientWs.readyState === clientWs.OPEN) {
+      clientWs.send(JSON.stringify(payload));
+    }
+  };
+
+  ai.live
+    .connect({
+      model: LIVE_MODEL,
+      config: {
+        responseModalities: [Modality.AUDIO],
+        systemInstruction: SYSTEM_PROMPT,
+        speechConfig: {
+          languageCode: "ko-KR",
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } },
+        },
+        inputAudioTranscription: {},
+        outputAudioTranscription: {},
+        realtimeInputConfig: {
+          automaticActivityDetection: {
+            startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
+            endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
+            silenceDurationMs: 400,
+          },
+        },
+      },
+      callbacks: {
+        onopen: () => send({ type: "ready" }),
+        onmessage: (message) => handleGeminiMessage(message, send),
+        onerror: (err) => {
+          console.error("Gemini Live 오류:", err?.message || err);
+          send({ type: "error", message: "AI 연결 중 오류가 발생했어요." });
+        },
+        onclose: (event) => {
+          console.error("Gemini Live 종료:", event?.code, event?.reason);
+          if (!closedByClient) {
+            send({ type: "error", message: "AI 연결이 종료됐어요." });
+          }
+        },
+      },
+    })
+    .then((session) => {
+      liveSession = session;
+    })
+    .catch((err) => {
+      console.error("Gemini Live 연결 실패:", err?.message || err);
+      send({ type: "error", message: "AI 연결에 실패했어요. API 키를 확인해주세요." });
+      clientWs.close();
+    });
+
+  clientWs.on("message", (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+
+    if (msg.type === "audio" && liveSession) {
+      const rate = msg.sampleRate || 16000;
+      liveSession.sendRealtimeInput({
+        audio: { data: msg.data, mimeType: `audio/pcm;rate=${rate}` },
+      });
+      receivedChunks++;
+      if (receivedChunks % 20 === 0) {
+        console.log(`[클라이언트] 오디오 ${receivedChunks}청크 전달 (rate=${rate})`);
+      }
+    }
+  });
+
+  clientWs.on("close", () => {
+    closedByClient = true;
+    liveSession?.close();
+  });
+});
+
+function handleGeminiMessage(message, send) {
+  if (message.data) {
+    console.log(`[Gemini] 오디오 청크 수신 (${message.data.length}자 base64)`);
+    send({ type: "audio", data: message.data });
+  }
+
+  const sc = message.serverContent;
+  if (sc?.inputTranscription?.text) {
+    console.log(`[Gemini] 사용자 발화 인식: ${sc.inputTranscription.text}`);
+    send({ type: "userText", text: sc.inputTranscription.text });
+  }
+  if (sc?.outputTranscription?.text) {
+    console.log(`[Gemini] 응답 텍스트: ${sc.outputTranscription.text}`);
+    send({ type: "modelText", text: sc.outputTranscription.text });
+  }
+  if (sc?.interrupted) {
+    send({ type: "interrupted" });
+  }
+  if (sc?.turnComplete) {
+    console.log("[Gemini] 턴 완료");
+    send({ type: "turnComplete" });
+  }
+}
+
+server.listen(PORT, () => {
+  console.log(`멘코 서버가 http://localhost:${PORT} 에서 실행 중입니다.`);
+});

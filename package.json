@@ -1,0 +1,17 @@
+{
+  "name": "mencoo-mvp",
+  "version": "0.1.0",
+  "description": "멘코 - 웹 기반 음성 대화 멘탈코치 AI MVP",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@google/genai": "^1.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "ws": "^8.21.3"
+  }
+}
