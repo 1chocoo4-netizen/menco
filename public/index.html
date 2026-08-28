@@ -176,6 +176,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    padding: 20px;
     z-index: 10;
     animation: fadeIn 0.25s ease;
   }
@@ -191,6 +192,18 @@
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
   }
 
+  .modal-card.consent-card {
+    max-width: 400px;
+    width: 100%;
+    text-align: left;
+    max-height: 88vh;
+    overflow-y: auto;
+  }
+
+  @media (max-width: 420px) {
+    .modal-card { padding: 26px 20px; }
+  }
+
   .modal-emoji { font-size: 40px; margin-bottom: 12px; }
 
   .modal-title {
@@ -198,6 +211,112 @@
     font-weight: 600;
     line-height: 1.5;
     margin-bottom: 24px;
+  }
+
+  .consent-card .modal-title { text-align: center; }
+
+  .consent-list {
+    list-style: none;
+    margin: 0 0 28px;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    font-size: 14px;
+    line-height: 1.6;
+    color: var(--text);
+  }
+
+  .consent-card .modal-close-btn { display: block; margin: 0 auto; }
+
+  .modal-close-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .consent-form {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    margin-bottom: 26px;
+  }
+
+  .form-row {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .form-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted);
+  }
+
+  .gender-options {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .pill-option {
+    position: relative;
+    display: inline-flex;
+  }
+
+  .pill-option input {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    margin: 0;
+    cursor: pointer;
+  }
+
+  .pill-option span {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 40px;
+    padding: 9px 18px;
+    border-radius: 999px;
+    border: 1px solid rgba(242, 242, 247, 0.25);
+    background: rgba(242, 242, 247, 0.06);
+    font-size: 14px;
+    color: var(--text);
+    white-space: nowrap;
+    transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+  }
+
+  .pill-option input:checked + span {
+    background: linear-gradient(135deg, var(--speak-1), var(--speak-2));
+    border-color: transparent;
+    color: #10151a;
+    font-weight: 600;
+  }
+
+  .pill-option input:focus-visible + span {
+    outline: 2px solid var(--speak-2);
+    outline-offset: 2px;
+  }
+
+  .age-input {
+    width: 100%;
+    padding: 12px 14px;
+    border-radius: 12px;
+    border: 1px solid rgba(242, 242, 247, 0.25);
+    background: rgba(242, 242, 247, 0.06);
+    color: var(--text);
+    font-size: 16px;
+    font-family: inherit;
+    outline: none;
+  }
+
+  .age-input:focus {
+    border-color: var(--speak-2);
+  }
+
+  .age-input::placeholder {
+    color: var(--muted);
   }
 
   .modal-close-btn {
@@ -234,6 +353,52 @@
   <div class="status" id="status">버튼을 누르고 멘탈 대화를 시작해 보세요</div>
 
   <button id="finishButton" class="finish-btn" hidden>코칭 완료</button>
+
+  <div id="consentModal" class="modal-overlay">
+    <div class="modal-card consent-card">
+      <div class="modal-title">멘탈코치 멘코 이용 안내</div>
+      <ul class="consent-list">
+        <li>🔒 대화 내용은 익명화되어 연구·분석 목적으로만 저장되며, 연구자 외에는 누구도 볼 수 없습니다.</li>
+        <li>📊 질문과 답변은 익명화된 멘탈 역량 분석 및 교육·연구에 활용될 수 있습니다.</li>
+        <li>🤝 멘코의 모든 코칭은 코칭 윤리와 개인정보 보호 원칙을 따릅니다.</li>
+      </ul>
+
+      <div class="consent-form">
+        <div class="form-row">
+          <label class="form-label">성별</label>
+          <div class="gender-options" role="radiogroup" aria-label="성별">
+            <label class="pill-option">
+              <input type="radio" name="gender" value="female" />
+              <span>여성</span>
+            </label>
+            <label class="pill-option">
+              <input type="radio" name="gender" value="male" />
+              <span>남성</span>
+            </label>
+            <label class="pill-option">
+              <input type="radio" name="gender" value="unspecified" />
+              <span>응답 안 함</span>
+            </label>
+          </div>
+        </div>
+        <div class="form-row">
+          <label class="form-label" for="ageInput">나이</label>
+          <input
+            type="text"
+            id="ageInput"
+            class="age-input"
+            inputmode="numeric"
+            pattern="[0-9]*"
+            autocomplete="off"
+            placeholder="예: 28"
+            maxlength="3"
+          />
+        </div>
+      </div>
+
+      <button id="consentAgreeButton" class="modal-close-btn" disabled>동의합니다</button>
+    </div>
+  </div>
 
   <div id="completionModal" class="modal-overlay" hidden>
     <div class="modal-card">

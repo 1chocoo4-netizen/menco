@@ -1,2 +1,7 @@
 node_modules/
 .env
+admin/node_modules/
+admin/.next/
+admin/next-env.d.ts
+admin/.env*.local
+admin/data/offline-research.json

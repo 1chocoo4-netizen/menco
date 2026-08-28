@@ -12,6 +12,34 @@ const LIVE_MODEL = process.env.GEMINI_LIVE_MODEL || "gemini-2.5-flash-native-aud
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
+const ADMIN_API_URL = process.env.ADMIN_API_URL;
+const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN;
+
+async function saveSessionToAdmin({ gender, age, transcriptTurns }) {
+  if (!ADMIN_API_URL || !INTERNAL_API_TOKEN) return;
+  if (transcriptTurns.length === 0) return;
+
+  const transcript = transcriptTurns.map((t) => `${t.speaker}: ${t.text}`).join("\n");
+
+  try {
+    const res = await fetch(`${ADMIN_API_URL}/api/offline/online-capture`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-internal-token": INTERNAL_API_TOKEN,
+      },
+      body: JSON.stringify({ gender, age, transcript }),
+    });
+    if (!res.ok) {
+      console.error("[온라인 세션 저장] admin 응답 오류:", res.status, await res.text());
+    } else {
+      console.log("[온라인 세션 저장] admin에 저장 완료");
+    }
+  } catch (err) {
+    console.error("[온라인 세션 저장] admin 연결 실패:", err?.message || err);
+  }
+}
+
 const SYSTEM_PROMPT = `너는 '멘코(MentCo)'라는 이름의 전문 멘탈 코치 AI야.
 국제코치연맹(ICF) MCC 수준의 코칭 역량과 한국코치협회(KCA) KSC 자격의 코칭 철학을 체화한,
 유연하고 노련한 세계 최고 수준의 전문 코치처럼 대화해.
@@ -47,7 +75,12 @@ const SYSTEM_PROMPT = `너는 '멘코(MentCo)'라는 이름의 전문 멘탈 코
 
 [경계]
 자살, 자해, 심각한 정신건강 위기 신호가 보이면 코칭을 멈추고 즉시 전문 상담기관이나
-정신건강 위기상담전화(1393)로 연결하도록 진지하게 안내한다.`;
+정신건강 위기상담전화(1393)로 연결하도록 진지하게 안내한다.
+
+[코칭 완료 신호]
+대화가 Will/Wrap-up 단계에 접어들어, 고객의 다음 행동 다짐을 확인하고 격려와 응원의 말로
+마무리를 시작하는 바로 그 시점에 반드시 mark_coaching_wrap_up 함수를 한 번 호출해라.
+아직 대화 초반이거나 탐색·질문이 이어지는 중이라면 호출하지 않는다. 세션당 한 번만 호출한다.`;
 
 app.use(express.static("public"));
 
@@ -59,10 +92,25 @@ wss.on("connection", (clientWs) => {
   let liveSession = null;
   let closedByClient = false;
   let receivedChunks = 0;
+  let participantInfo = null;
+  const transcriptTurns = [];
+  let userBuffer = "";
+  let modelBuffer = "";
 
   const send = (payload) => {
     if (clientWs.readyState === clientWs.OPEN) {
       clientWs.send(JSON.stringify(payload));
+    }
+  };
+
+  const onTranscriptEvent = (kind, text) => {
+    if (kind === "user_chunk") userBuffer += text;
+    else if (kind === "model_chunk") modelBuffer += text;
+    else if (kind === "turn_complete") {
+      if (userBuffer.trim()) transcriptTurns.push({ speaker: "고객", text: userBuffer.trim() });
+      if (modelBuffer.trim()) transcriptTurns.push({ speaker: "멘코", text: modelBuffer.trim() });
+      userBuffer = "";
+      modelBuffer = "";
     }
   };
 
@@ -78,6 +126,17 @@ wss.on("connection", (clientWs) => {
         },
         inputAudioTranscription: {},
         outputAudioTranscription: {},
+        tools: [
+          {
+            functionDeclarations: [
+              {
+                name: "mark_coaching_wrap_up",
+                description:
+                  "코칭 대화가 Will/Wrap-up(마무리) 단계에 접어들어 격려와 응원으로 세션을 마무리하기 시작할 때 정확히 한 번 호출한다.",
+              },
+            ],
+          },
+        ],
         realtimeInputConfig: {
           automaticActivityDetection: {
             startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
@@ -88,7 +147,13 @@ wss.on("connection", (clientWs) => {
       },
       callbacks: {
         onopen: () => send({ type: "ready" }),
-        onmessage: (message) => handleGeminiMessage(message, send),
+        onmessage: (message) =>
+          handleGeminiMessage(
+            message,
+            send,
+            (functionResponses) => liveSession?.sendToolResponse({ functionResponses }),
+            onTranscriptEvent
+          ),
         onerror: (err) => {
           console.error("Gemini Live 오류:", err?.message || err);
           send({ type: "error", message: "AI 연결 중 오류가 발생했어요." });
@@ -118,6 +183,14 @@ wss.on("connection", (clientWs) => {
       return;
     }
 
+    if (msg.type === "start") {
+      const age = Number(msg.age);
+      participantInfo = {
+        gender: ["female", "male", "unspecified"].includes(msg.gender) ? msg.gender : "unspecified",
+        age: Number.isFinite(age) && age > 0 && age <= 120 ? age : 0,
+      };
+    }
+
     if (msg.type === "audio" && liveSession) {
       const rate = msg.sampleRate || 16000;
       liveSession.sendRealtimeInput({
@@ -133,10 +206,26 @@ wss.on("connection", (clientWs) => {
   clientWs.on("close", () => {
     closedByClient = true;
     liveSession?.close();
+    onTranscriptEvent("turn_complete"); // 마지막 턴이 turnComplete 없이 끝났을 경우 대비
+    if (participantInfo && participantInfo.age > 0) {
+      saveSessionToAdmin({ ...participantInfo, transcriptTurns });
+    }
   });
 });
 
-function handleGeminiMessage(message, send) {
+function handleGeminiMessage(message, send, sendToolResponse, onTranscript) {
+  if (message.toolCall?.functionCalls?.length) {
+    const responses = [];
+    for (const call of message.toolCall.functionCalls) {
+      if (call.name === "mark_coaching_wrap_up") {
+        console.log("[Gemini] 코칭 마무리 단계 진입 신호 수신");
+        send({ type: "showFinishButton" });
+      }
+      responses.push({ id: call.id, name: call.name, response: { output: "ok" } });
+    }
+    sendToolResponse(responses);
+  }
+
   if (message.data) {
     console.log(`[Gemini] 오디오 청크 수신 (${message.data.length}자 base64)`);
     send({ type: "audio", data: message.data });
@@ -146,15 +235,18 @@ function handleGeminiMessage(message, send) {
   if (sc?.inputTranscription?.text) {
     console.log(`[Gemini] 사용자 발화 인식: ${sc.inputTranscription.text}`);
     send({ type: "userText", text: sc.inputTranscription.text });
+    onTranscript?.("user_chunk", sc.inputTranscription.text);
   }
   if (sc?.outputTranscription?.text) {
     console.log(`[Gemini] 응답 텍스트: ${sc.outputTranscription.text}`);
     send({ type: "modelText", text: sc.outputTranscription.text });
+    onTranscript?.("model_chunk", sc.outputTranscription.text);
   }
   if (sc?.interrupted) {
     send({ type: "interrupted" });
   }
   if (sc?.turnComplete) {
+    onTranscript?.("turn_complete");
     console.log("[Gemini] 턴 완료");
     send({ type: "turnComplete" });
   }

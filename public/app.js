@@ -4,6 +4,34 @@ const bodyEl = document.body;
 const finishButton = document.getElementById("finishButton");
 const completionModal = document.getElementById("completionModal");
 const modalCloseButton = document.getElementById("modalCloseButton");
+const consentModal = document.getElementById("consentModal");
+const consentAgreeButton = document.getElementById("consentAgreeButton");
+const genderInputs = document.querySelectorAll('input[name="gender"]');
+const ageInput = document.getElementById("ageInput");
+
+function updateConsentButtonState() {
+  const genderSelected = Array.from(genderInputs).some((el) => el.checked);
+  const age = Number(ageInput.value.trim());
+  const ageValid = /^\d{1,3}$/.test(ageInput.value.trim()) && age >= 1 && age <= 120;
+  consentAgreeButton.disabled = !(genderSelected && ageValid);
+}
+
+ageInput.addEventListener("input", () => {
+  ageInput.value = ageInput.value.replace(/[^0-9]/g, "");
+  updateConsentButtonState();
+});
+genderInputs.forEach((el) => el.addEventListener("change", updateConsentButtonState));
+
+let capturedGender = "unspecified";
+let capturedAge = 0;
+
+consentAgreeButton.addEventListener("click", () => {
+  if (consentAgreeButton.disabled) return;
+  const checked = Array.from(genderInputs).find((el) => el.checked);
+  capturedGender = checked ? checked.value : "unspecified";
+  capturedAge = Number(ageInput.value.trim());
+  consentModal.hidden = true;
+});
 
 let ws = null;
 let sessionActive = false;
@@ -157,6 +185,10 @@ function connect() {
   const protocol = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${protocol}://${location.host}/live`);
 
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: "start", gender: capturedGender, age: capturedAge }));
+  };
+
   ws.onmessage = async (event) => {
     const msg = JSON.parse(event.data);
 
@@ -185,6 +217,9 @@ function connect() {
       case "userText":
         break;
       case "modelText":
+        break;
+      case "showFinishButton":
+        finishButton.hidden = false;
         break;
       case "error":
         console.error("서버 오류:", msg.message);
@@ -221,7 +256,6 @@ micButton.addEventListener("click", () => {
     if (!outputAudioContext) outputAudioContext = new AudioContext({ sampleRate: 24000 });
     outputAudioContext.resume();
     connect();
-    finishButton.hidden = false;
   } else {
     endSession();
   }
