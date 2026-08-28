@@ -159,6 +159,12 @@ wss.on("connection", (clientWs) => {
             silenceDurationMs: 400,
           },
         },
+        // 오디오는 텍스트보다 토큰을 훨씬 빨리 소모해서, 이걸 켜지 않으면 몇 분 만에
+        // 컨텍스트 윈도우 한도에 도달해 세션이 강제 종료된다. 슬라이딩 윈도우로
+        // 오래된 대화를 자동 압축해 장시간 세션이 끊기지 않게 한다.
+        contextWindowCompression: {
+          slidingWindow: {},
+        },
       },
       callbacks: {
         onopen: () => send({ type: "ready" }),
