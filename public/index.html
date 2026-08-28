@@ -154,6 +154,67 @@
     0%, 100% { opacity: 1; }
     50% { opacity: 0.6; }
   }
+
+  .finish-btn {
+    margin-top: -12px;
+    padding: 10px 24px;
+    border-radius: 999px;
+    border: 1px solid rgba(242, 242, 247, 0.25);
+    background: rgba(242, 242, 247, 0.08);
+    color: var(--text);
+    font-size: 14px;
+    cursor: pointer;
+    transition: background 0.2s ease;
+  }
+  .finish-btn:hover { background: rgba(242, 242, 247, 0.16); }
+  .finish-btn[hidden] { display: none; }
+
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(10, 10, 14, 0.72);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 10;
+    animation: fadeIn 0.25s ease;
+  }
+  .modal-overlay[hidden] { display: none; }
+
+  .modal-card {
+    background: linear-gradient(160deg, #2a2a38, #201f29);
+    border: 1px solid rgba(242, 242, 247, 0.1);
+    border-radius: 20px;
+    padding: 36px 32px;
+    max-width: 320px;
+    text-align: center;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  }
+
+  .modal-emoji { font-size: 40px; margin-bottom: 12px; }
+
+  .modal-title {
+    font-size: 18px;
+    font-weight: 600;
+    line-height: 1.5;
+    margin-bottom: 24px;
+  }
+
+  .modal-close-btn {
+    padding: 10px 28px;
+    border-radius: 999px;
+    border: none;
+    background: linear-gradient(135deg, var(--speak-1), var(--speak-2));
+    color: #10151a;
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
 </style>
 </head>
 <body>
@@ -171,6 +232,16 @@
   </div>
 
   <div class="status" id="status">버튼을 누르고 멘탈 대화를 시작해 보세요</div>
+
+  <button id="finishButton" class="finish-btn" hidden>코칭 완료</button>
+
+  <div id="completionModal" class="modal-overlay" hidden>
+    <div class="modal-card">
+      <div class="modal-emoji">🎉</div>
+      <div class="modal-title">오늘의 한걸음을<br />응원합니다!!</div>
+      <button id="modalCloseButton" class="modal-close-btn">확인</button>
+    </div>
+  </div>
 
   <script src="app.js"></script>
 </body>

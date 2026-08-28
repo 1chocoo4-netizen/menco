@@ -1,6 +1,9 @@
 const micButton = document.getElementById("micButton");
 const statusEl = document.getElementById("status");
 const bodyEl = document.body;
+const finishButton = document.getElementById("finishButton");
+const completionModal = document.getElementById("completionModal");
+const modalCloseButton = document.getElementById("modalCloseButton");
 
 let ws = null;
 let sessionActive = false;
@@ -208,6 +211,7 @@ function endSession() {
     ws.close();
     ws = null;
   }
+  finishButton.hidden = true;
   setState(null, "버튼을 누르고 멘탈 대화를 시작해 보세요");
 }
 
@@ -217,7 +221,17 @@ micButton.addEventListener("click", () => {
     if (!outputAudioContext) outputAudioContext = new AudioContext({ sampleRate: 24000 });
     outputAudioContext.resume();
     connect();
+    finishButton.hidden = false;
   } else {
     endSession();
   }
+});
+
+finishButton.addEventListener("click", () => {
+  endSession();
+  completionModal.hidden = false;
+});
+
+modalCloseButton.addEventListener("click", () => {
+  completionModal.hidden = true;
 });
