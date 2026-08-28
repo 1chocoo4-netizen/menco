@@ -153,6 +153,11 @@ wss.on("connection", (clientWs) => {
   let userBuffer = "";
   let modelBuffer = "";
   let resumptionHandle = null;
+  // GoAway 후 재연결하는 짧은 틈에는 liveSession이 비어있거나 죽어가는 소켓을 가리킨다.
+  // transparent 재연결은 Gemini API(Vertex 전용 기능)에서 지원하지 않으므로,
+  // 그 틈에 들어온 오디오를 직접 버퍼링했다가 새 세션이 열리자마자 흘려보낸다.
+  const pendingAudio = [];
+  const MAX_PENDING_AUDIO = 300; // 청크당 ~128ms, 약 38초 분량까지만 보관
 
   const send = (payload) => {
     if (clientWs.readyState === clientWs.OPEN) {
@@ -175,6 +180,10 @@ wss.on("connection", (clientWs) => {
     // 재연결로 만들어진 세션이 나중에 (예상대로) 닫힐 때는 클라이언트에
     // 에러를 보내지 않기 위한 플래그. goAway를 받으면 즉시 false로 바뀐다.
     let isCurrentSession = true;
+    // 이 connectLive 호출로 만들어진 세션 객체를 직접 들고 있는다.
+    // liveSession(바깥 변수)은 재연결 과정에서 다른 세션으로 바뀔 수 있으므로,
+    // onclose에서 "내가 여전히 현재 세션인지"를 판단하려면 이 참조가 필요하다.
+    let thisSession = null;
 
     ai.live
       .connect({
@@ -204,10 +213,13 @@ wss.on("connection", (clientWs) => {
           },
           onerror: (err) => {
             console.error("Gemini Live 오류:", err?.message || err);
+            if (liveSession === thisSession) liveSession = null;
             if (isCurrentSession) send({ type: "error", message: "AI 연결 중 오류가 발생했어요." });
           },
           onclose: (event) => {
             console.error("Gemini Live 종료:", event?.code, event?.reason);
+            // 새 세션으로 이미 넘어갔다면 옛 세션이 뒤늦게 닫혀도 liveSession을 건드리지 않는다.
+            if (liveSession === thisSession) liveSession = null;
             if (!closedByClient && isCurrentSession) {
               send({ type: "error", message: "AI 연결이 종료됐어요." });
             }
@@ -221,7 +233,19 @@ wss.on("connection", (clientWs) => {
           session.close();
           return;
         }
+        thisSession = session;
         liveSession = session;
+        if (pendingAudio.length > 0) {
+          console.log(`[Gemini] 재연결 대기 중 쌓인 오디오 ${pendingAudio.length}청크 전달`);
+          for (const payload of pendingAudio) {
+            try {
+              session.sendRealtimeInput(payload);
+            } catch (err) {
+              console.error("[Gemini] 대기 오디오 전달 실패:", err?.message || err);
+            }
+          }
+          pendingAudio.length = 0;
+        }
       })
       .catch((err) => {
         console.error("Gemini Live 연결 실패:", err?.message || err);
@@ -252,11 +276,22 @@ wss.on("connection", (clientWs) => {
       };
     }
 
-    if (msg.type === "audio" && liveSession) {
+    if (msg.type === "audio") {
       const rate = msg.sampleRate || 16000;
-      liveSession.sendRealtimeInput({
-        audio: { data: msg.data, mimeType: `audio/pcm;rate=${rate}` },
-      });
+      const payload = { audio: { data: msg.data, mimeType: `audio/pcm;rate=${rate}` } };
+      if (liveSession) {
+        try {
+          liveSession.sendRealtimeInput(payload);
+        } catch (err) {
+          console.error("[Gemini] 오디오 전송 실패, 재연결 대기열에 보관:", err?.message || err);
+          liveSession = null;
+          pendingAudio.push(payload);
+        }
+      } else {
+        // 재연결 중 (GoAway~새 세션 open 사이). 새 세션이 열리면 순서대로 전달된다.
+        pendingAudio.push(payload);
+        if (pendingAudio.length > MAX_PENDING_AUDIO) pendingAudio.shift();
+      }
       receivedChunks++;
       if (receivedChunks % 20 === 0) {
         console.log(`[클라이언트] 오디오 ${receivedChunks}청크 전달 (rate=${rate})`);
