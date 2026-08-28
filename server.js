@@ -100,6 +100,49 @@ app.use(express.static("public"));
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/live" });
 
+function buildLiveConfig(resumptionHandle) {
+  return {
+    responseModalities: [Modality.AUDIO],
+    systemInstruction: SYSTEM_PROMPT,
+    speechConfig: {
+      languageCode: "ko-KR",
+      voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } },
+    },
+    inputAudioTranscription: {},
+    outputAudioTranscription: {},
+    tools: [
+      {
+        functionDeclarations: [
+          {
+            name: "mark_coaching_wrap_up",
+            description:
+              "코칭 대화가 Will/Wrap-up(마무리) 단계에 접어들어 격려와 응원으로 세션을 마무리하기 시작할 때 정확히 한 번 호출한다.",
+          },
+        ],
+      },
+    ],
+    realtimeInputConfig: {
+      automaticActivityDetection: {
+        startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
+        endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
+        // 짧은 잡음/숨소리에 반응하지 않도록, 이만큼 지속된 소리만 "발화 시작"으로 인정.
+        // HIGH 민감도의 빠른 반응성은 유지하면서 바지인 오탐만 걸러낸다.
+        prefixPaddingMs: 200,
+        silenceDurationMs: 400,
+      },
+    },
+    // 오디오는 텍스트보다 토큰을 훨씬 빨리 소모해서, 이걸 켜지 않으면 몇 분 만에
+    // 컨텍스트 윈도우 한도에 도달해 세션이 강제 종료된다. 슬라이딩 윈도우로
+    // 오래된 대화를 자동 압축해 장시간 세션이 끊기지 않게 한다.
+    contextWindowCompression: {
+      slidingWindow: {},
+    },
+    // Live API 연결 자체가 일정 시간 후 GoAway와 함께 강제 종료되는데,
+    // 세션 재개를 켜두면 handle을 받아뒀다가 끊기기 직전 조용히 재연결할 수 있다.
+    sessionResumption: resumptionHandle ? { handle: resumptionHandle } : {},
+  };
+}
+
 wss.on("connection", (clientWs) => {
   console.log("[클라이언트] 연결됨");
   let liveSession = null;
@@ -109,6 +152,7 @@ wss.on("connection", (clientWs) => {
   const transcriptTurns = [];
   let userBuffer = "";
   let modelBuffer = "";
+  let resumptionHandle = null;
 
   const send = (payload) => {
     if (clientWs.readyState === clientWs.OPEN) {
@@ -127,74 +171,70 @@ wss.on("connection", (clientWs) => {
     }
   };
 
-  ai.live
-    .connect({
-      model: LIVE_MODEL,
-      config: {
-        responseModalities: [Modality.AUDIO],
-        systemInstruction: SYSTEM_PROMPT,
-        speechConfig: {
-          languageCode: "ko-KR",
-          voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } },
-        },
-        inputAudioTranscription: {},
-        outputAudioTranscription: {},
-        tools: [
-          {
-            functionDeclarations: [
-              {
-                name: "mark_coaching_wrap_up",
-                description:
-                  "코칭 대화가 Will/Wrap-up(마무리) 단계에 접어들어 격려와 응원으로 세션을 마무리하기 시작할 때 정확히 한 번 호출한다.",
-              },
-            ],
+  function connectLive(isReconnect) {
+    // 재연결로 만들어진 세션이 나중에 (예상대로) 닫힐 때는 클라이언트에
+    // 에러를 보내지 않기 위한 플래그. goAway를 받으면 즉시 false로 바뀐다.
+    let isCurrentSession = true;
+
+    ai.live
+      .connect({
+        model: LIVE_MODEL,
+        config: buildLiveConfig(resumptionHandle),
+        callbacks: {
+          onopen: () => {
+            if (!isReconnect) send({ type: "ready" });
+            else console.log("[Gemini] 세션 재연결 완료 (사용자 체감 끊김 없음)");
           },
-        ],
-        realtimeInputConfig: {
-          automaticActivityDetection: {
-            // HIGH로 두면 숨소리·잡음에도 "발화 시작"으로 오탐지되어 AI 응답이
-            // 중간에 끊기는 문제가 있어 LOW로 낮춤 (실제 발화만 끼어들기로 인식).
-            startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_LOW,
-            endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
-            silenceDurationMs: 400,
+          onmessage: (message) => {
+            if (message.sessionResumptionUpdate?.resumable && message.sessionResumptionUpdate.newHandle) {
+              resumptionHandle = message.sessionResumptionUpdate.newHandle;
+            }
+            if (message.goAway) {
+              console.log("[Gemini] GoAway 수신 (남은 시간:", message.goAway.timeLeft, ") — 재연결 시도");
+              isCurrentSession = false;
+              connectLive(true);
+              return;
+            }
+            handleGeminiMessage(
+              message,
+              send,
+              (functionResponses) => liveSession?.sendToolResponse({ functionResponses }),
+              onTranscriptEvent
+            );
+          },
+          onerror: (err) => {
+            console.error("Gemini Live 오류:", err?.message || err);
+            if (isCurrentSession) send({ type: "error", message: "AI 연결 중 오류가 발생했어요." });
+          },
+          onclose: (event) => {
+            console.error("Gemini Live 종료:", event?.code, event?.reason);
+            if (!closedByClient && isCurrentSession) {
+              send({ type: "error", message: "AI 연결이 종료됐어요." });
+            }
           },
         },
-        // 오디오는 텍스트보다 토큰을 훨씬 빨리 소모해서, 이걸 켜지 않으면 몇 분 만에
-        // 컨텍스트 윈도우 한도에 도달해 세션이 강제 종료된다. 슬라이딩 윈도우로
-        // 오래된 대화를 자동 압축해 장시간 세션이 끊기지 않게 한다.
-        contextWindowCompression: {
-          slidingWindow: {},
-        },
-      },
-      callbacks: {
-        onopen: () => send({ type: "ready" }),
-        onmessage: (message) =>
-          handleGeminiMessage(
-            message,
-            send,
-            (functionResponses) => liveSession?.sendToolResponse({ functionResponses }),
-            onTranscriptEvent
-          ),
-        onerror: (err) => {
-          console.error("Gemini Live 오류:", err?.message || err);
-          send({ type: "error", message: "AI 연결 중 오류가 발생했어요." });
-        },
-        onclose: (event) => {
-          console.error("Gemini Live 종료:", event?.code, event?.reason);
-          if (!closedByClient) {
-            send({ type: "error", message: "AI 연결이 종료됐어요." });
-          }
-        },
-      },
-    })
-    .then((session) => {
-      liveSession = session;
-    })
-    .catch((err) => {
-      console.error("Gemini Live 연결 실패:", err?.message || err);
-      send({ type: "error", message: "AI 연결에 실패했어요. API 키를 확인해주세요." });
-      clientWs.close();
-    });
+      })
+      .then((session) => {
+        // 연결이 완료되기 전에 클라이언트가 이미 나갔다면 곧바로 정리한다
+        // (재연결 도중 사용자가 통화를 끊는 경우, 세션이 안 닫힌 채 남는 걸 방지).
+        if (closedByClient) {
+          session.close();
+          return;
+        }
+        liveSession = session;
+      })
+      .catch((err) => {
+        console.error("Gemini Live 연결 실패:", err?.message || err);
+        if (isReconnect) {
+          send({ type: "error", message: "AI 연결이 끊어져 재연결에 실패했어요. 다시 시작해주세요." });
+        } else {
+          send({ type: "error", message: "AI 연결에 실패했어요. API 키를 확인해주세요." });
+        }
+        clientWs.close();
+      });
+  }
+
+  connectLive(false);
 
   clientWs.on("message", (raw) => {
     let msg;
