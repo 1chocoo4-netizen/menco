@@ -46,18 +46,25 @@
 
   .affiliation {
     display: flex;
+    flex-direction: row;
     align-items: center;
-    gap: 8px;
-    margin-top: -20px;
+    gap: 16px;
+    margin-top: -24px;
+  }
+
+  .affiliation-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
   }
 
   .affiliation img {
-    height: 20px;
+    height: 17px;
     width: auto;
   }
 
   .affiliation span {
-    font-size: 13px;
+    font-size: 12px;
     color: var(--muted);
   }
 
@@ -339,8 +346,14 @@
 <body>
   <div class="title">MENCO</div>
   <div class="affiliation">
-    <img src="soongsil-logo.png" alt="숭실대학교 로고" />
-    <span>숭실대학교 커리어학습코칭 연구소</span>
+    <div class="affiliation-row">
+      <img src="soongsil-logo.png" alt="숭실대학교 로고" />
+      <span>숭실대학교 부설</span>
+    </div>
+    <div class="affiliation-row">
+      <img src="kcrilc-icon.png" alt="한국커리어·학습코칭연구소 로고" />
+      <span class="kcrilc-text">한국커리어·학습코칭연구소</span>
+    </div>
   </div>
 
   <div class="mic-wrap">
