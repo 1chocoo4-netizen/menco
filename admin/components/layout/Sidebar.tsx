@@ -3,13 +3,14 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { cn } from "@/lib/utils";
-import { LayoutDashboard, Activity, FileSearch, Download, Sparkles, ClipboardList } from "lucide-react";
+import { LayoutDashboard, Activity, FileSearch, Download, Sparkles, ClipboardList, Ticket } from "lucide-react";
 
 const NAV_ITEMS = [
   { href: "/", label: "대시보드 요약", icon: LayoutDashboard },
   { href: "/mental-competency", label: "멘탈 역량 분석", icon: Activity },
   { href: "/evidence", label: "대화 근거/원문 데이터베이스", icon: FileSearch },
   { href: "/offline-research", label: "오프라인 연구 데이터", icon: ClipboardList },
+  { href: "/coupons", label: "쿠폰", icon: Ticket },
   { href: "/export", label: "데이터 Export", icon: Download },
 ];
 

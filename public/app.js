@@ -8,12 +8,15 @@ const consentModal = document.getElementById("consentModal");
 const consentAgreeButton = document.getElementById("consentAgreeButton");
 const genderInputs = document.querySelectorAll('input[name="gender"]');
 const ageInput = document.getElementById("ageInput");
+const couponInput = document.getElementById("couponInput");
+const couponError = document.getElementById("couponError");
 
 function updateConsentButtonState() {
   const genderSelected = Array.from(genderInputs).some((el) => el.checked);
   const age = Number(ageInput.value.trim());
   const ageValid = /^\d{1,3}$/.test(ageInput.value.trim()) && age >= 1 && age <= 120;
-  consentAgreeButton.disabled = !(genderSelected && ageValid);
+  const couponEntered = couponInput.value.trim().length > 0;
+  consentAgreeButton.disabled = !(genderSelected && ageValid && couponEntered);
 }
 
 ageInput.addEventListener("input", () => {
@@ -21,16 +24,43 @@ ageInput.addEventListener("input", () => {
   updateConsentButtonState();
 });
 genderInputs.forEach((el) => el.addEventListener("change", updateConsentButtonState));
+couponInput.addEventListener("input", () => {
+  couponError.hidden = true;
+  updateConsentButtonState();
+});
 
 let capturedGender = "unspecified";
 let capturedAge = 0;
 
-consentAgreeButton.addEventListener("click", () => {
+consentAgreeButton.addEventListener("click", async () => {
   if (consentAgreeButton.disabled) return;
-  const checked = Array.from(genderInputs).find((el) => el.checked);
-  capturedGender = checked ? checked.value : "unspecified";
-  capturedAge = Number(ageInput.value.trim());
-  consentModal.hidden = true;
+
+  consentAgreeButton.disabled = true;
+  consentAgreeButton.textContent = "확인 중...";
+  couponError.hidden = true;
+
+  try {
+    const res = await fetch("/api/coupon/redeem", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code: couponInput.value.trim() }),
+    });
+    const result = await res.json().catch(() => ({ ok: false, error: "쿠폰 확인 중 오류가 발생했어요." }));
+
+    if (!res.ok || !result.ok) {
+      couponError.textContent = result.error || "유효하지 않은 쿠폰이에요.";
+      couponError.hidden = false;
+      return;
+    }
+
+    const checked = Array.from(genderInputs).find((el) => el.checked);
+    capturedGender = checked ? checked.value : "unspecified";
+    capturedAge = Number(ageInput.value.trim());
+    consentModal.hidden = true;
+  } finally {
+    consentAgreeButton.textContent = "동의합니다";
+    updateConsentButtonState();
+  }
 });
 
 let ws = null;
@@ -247,7 +277,7 @@ function endSession() {
     ws = null;
   }
   finishButton.hidden = true;
-  setState(null, "버튼을 누르고 멘탈 대화를 시작해 보세요");
+  setState(null, "버튼을 누르고 멘탈 코칭 대화를 시작해 보세요");
 }
 
 micButton.addEventListener("click", () => {

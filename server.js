@@ -96,6 +96,34 @@ const SYSTEM_PROMPT = `너는 '멘코(MentCo)'라는 이름의 전문 멘탈 코
 아직 대화 초반이거나 탐색·질문이 이어지는 중이라면 호출하지 않는다. 세션당 한 번만 호출한다.`;
 
 app.use(express.static("public"));
+app.use(express.json());
+
+app.post("/api/coupon/redeem", async (req, res) => {
+  const code = typeof req.body?.code === "string" ? req.body.code : "";
+  if (!code.trim()) {
+    return res.status(400).json({ ok: false, error: "쿠폰 코드를 입력해주세요." });
+  }
+  if (!ADMIN_API_URL || !INTERNAL_API_TOKEN) {
+    console.error("[쿠폰 검증] ADMIN_API_URL/INTERNAL_API_TOKEN 미설정");
+    return res.status(503).json({ ok: false, error: "쿠폰 확인 서비스를 사용할 수 없어요. 잠시 후 다시 시도해주세요." });
+  }
+
+  try {
+    const adminRes = await fetch(`${ADMIN_API_URL}/api/coupons/redeem`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-internal-token": INTERNAL_API_TOKEN,
+      },
+      body: JSON.stringify({ code }),
+    });
+    const body = await adminRes.json().catch(() => ({ ok: false, error: "쿠폰 확인 중 오류가 발생했어요." }));
+    return res.status(adminRes.ok ? 200 : 400).json(body);
+  } catch (err) {
+    console.error("[쿠폰 검증] admin 연결 실패:", err?.message || err);
+    return res.status(503).json({ ok: false, error: "쿠폰 확인 서비스에 연결할 수 없어요. 잠시 후 다시 시도해주세요." });
+  }
+});
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/live" });

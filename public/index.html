@@ -49,7 +49,7 @@
     flex-direction: row;
     align-items: center;
     gap: 16px;
-    margin-top: -24px;
+    margin-bottom: -24px;
   }
 
   .affiliation-row {
@@ -326,6 +326,12 @@
     color: var(--muted);
   }
 
+  .coupon-error {
+    margin: 0;
+    font-size: 12.5px;
+    color: #ff8f8f;
+  }
+
   .modal-close-btn {
     padding: 10px 28px;
     border-radius: 999px;
@@ -344,7 +350,6 @@
 </style>
 </head>
 <body>
-  <div class="title">MENCO</div>
   <div class="affiliation">
     <div class="affiliation-row">
       <img src="soongsil-logo.png" alt="숭실대학교 로고" />
@@ -355,6 +360,7 @@
       <span class="kcrilc-text">한국커리어·학습코칭연구소</span>
     </div>
   </div>
+  <div class="title">MENCO</div>
 
   <div class="mic-wrap">
     <div class="ring"></div>
@@ -363,7 +369,7 @@
     </button>
   </div>
 
-  <div class="status" id="status">버튼을 누르고 멘탈 대화를 시작해 보세요</div>
+  <div class="status" id="status">버튼을 누르고 멘탈 코칭 대화를 시작해 보세요</div>
 
   <button id="finishButton" class="finish-btn" hidden>코칭 완료</button>
 
@@ -406,6 +412,17 @@
             placeholder="예: 28"
             maxlength="3"
           />
+        </div>
+        <div class="form-row">
+          <label class="form-label" for="couponInput">쿠폰 코드</label>
+          <input
+            type="text"
+            id="couponInput"
+            class="age-input"
+            autocomplete="off"
+            autocapitalize="characters"
+          />
+          <p id="couponError" class="coupon-error" hidden></p>
         </div>
       </div>
 
