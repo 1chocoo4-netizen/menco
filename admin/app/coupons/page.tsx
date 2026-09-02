@@ -29,7 +29,9 @@ export default function CouponsPage() {
   const [expiresAt, setExpiresAt] = useState("");
   const [maxUses, setMaxUses] = useState("1000");
   const [quantity, setQuantity] = useState("1");
+  const [customCode, setCustomCode] = useState("");
   const [issuing, setIssuing] = useState(false);
+  const [issueError, setIssueError] = useState("");
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
   useEffect(() => {
@@ -45,11 +47,12 @@ export default function CouponsPage() {
 
   async function issue() {
     const maxUsesNum = Number(maxUses);
-    const quantityNum = Number(quantity);
+    const quantityNum = customCode.trim() ? 1 : Number(quantity);
     if (!Number.isFinite(maxUsesNum) || maxUsesNum < 1) return;
     if (!Number.isFinite(quantityNum) || quantityNum < 1) return;
 
     setIssuing(true);
+    setIssueError("");
     try {
       const res = await fetch("/api/coupons", {
         method: "POST",
@@ -59,15 +62,20 @@ export default function CouponsPage() {
           expiresAt: expiresAt || null,
           maxUses: maxUsesNum,
           quantity: quantityNum,
+          code: customCode.trim() || undefined,
         }),
       });
       const d = await res.json();
-      if (!res.ok) return;
+      if (!res.ok) {
+        setIssueError(d.error || "쿠폰 발급에 실패했습니다.");
+        return;
+      }
       setCoupons(d);
       setDescription("");
       setExpiresAt("");
       setMaxUses("1000");
       setQuantity("1");
+      setCustomCode("");
     } finally {
       setIssuing(false);
     }
@@ -129,6 +137,20 @@ export default function CouponsPage() {
                 className="w-full rounded-lg border border-border bg-bg/40 px-3 py-2 text-sm text-white placeholder:text-muted focus:outline-none focus:border-accent [color-scheme:dark]"
               />
             </div>
+            <div>
+              <p className="mb-1.5 text-xs font-medium text-muted">코드 직접 지정 (선택)</p>
+              <input
+                value={customCode}
+                onChange={(e) => {
+                  setIssueError("");
+                  setCustomCode(e.target.value);
+                }}
+                placeholder="예: 서초중학교 (비워두면 자동 생성됩니다)"
+                maxLength={40}
+                className="w-full rounded-lg border border-border bg-bg/40 px-3 py-2 text-sm text-white placeholder:text-muted focus:outline-none focus:border-accent"
+              />
+              <p className="mt-1 text-[11px] text-muted">원하는 글자를 자유롭게 입력하세요. 직접 지정 시 1개만 발급됩니다.</p>
+            </div>
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <p className="mb-1.5 text-xs font-medium text-muted">1개당 사용 횟수</p>
@@ -142,13 +164,15 @@ export default function CouponsPage() {
               <div>
                 <p className="mb-1.5 text-xs font-medium text-muted">발급 매수</p>
                 <input
-                  value={quantity}
+                  value={customCode.trim() ? "1" : quantity}
                   onChange={(e) => setQuantity(e.target.value.replace(/[^0-9]/g, ""))}
+                  disabled={!!customCode.trim()}
                   inputMode="numeric"
-                  className="w-full rounded-lg border border-border bg-bg/40 px-3 py-2 text-sm text-white placeholder:text-muted focus:outline-none focus:border-accent"
+                  className="w-full rounded-lg border border-border bg-bg/40 px-3 py-2 text-sm text-white placeholder:text-muted focus:outline-none focus:border-accent disabled:opacity-50"
                 />
               </div>
             </div>
+            {issueError && <p className="text-xs text-negative">{issueError}</p>}
             <Button className="w-full justify-center" disabled={issuing} onClick={issue}>
               <Plus size={15} />
               {issuing ? "발급 중..." : "쿠폰 발급"}

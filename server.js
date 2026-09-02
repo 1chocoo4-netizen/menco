@@ -15,31 +15,6 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const ADMIN_API_URL = process.env.ADMIN_API_URL;
 const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN;
 
-async function saveSessionToAdmin({ gender, age, transcriptTurns }) {
-  if (!ADMIN_API_URL || !INTERNAL_API_TOKEN) return;
-  if (transcriptTurns.length === 0) return;
-
-  const transcript = transcriptTurns.map((t) => `${t.speaker}: ${t.text}`).join("\n");
-
-  try {
-    const res = await fetch(`${ADMIN_API_URL}/api/offline/online-capture`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-internal-token": INTERNAL_API_TOKEN,
-      },
-      body: JSON.stringify({ gender, age, transcript }),
-    });
-    if (!res.ok) {
-      console.error("[온라인 세션 저장] admin 응답 오류:", res.status, await res.text());
-    } else {
-      console.log("[온라인 세션 저장] admin에 저장 완료");
-    }
-  } catch (err) {
-    console.error("[온라인 세션 저장] admin 연결 실패:", err?.message || err);
-  }
-}
-
 const SYSTEM_PROMPT = `너는 '멘코(MentCo)'라는 이름의 전문 멘탈 코치 AI야.
 국제코치연맹(ICF) MCC 수준의 코칭 역량과 한국코치협회(KCA) KSC 자격의 코칭 철학을 체화한,
 유연하고 노련한 세계 최고 수준의 전문 코치처럼 대화해.
@@ -176,16 +151,13 @@ wss.on("connection", (clientWs) => {
   let liveSession = null;
   let closedByClient = false;
   let receivedChunks = 0;
-  let participantInfo = null;
-  const transcriptTurns = [];
-  let userBuffer = "";
-  let modelBuffer = "";
   let resumptionHandle = null;
   // GoAway 후 재연결하는 짧은 틈에는 liveSession이 비어있거나 죽어가는 소켓을 가리킨다.
   // transparent 재연결은 Gemini API(Vertex 전용 기능)에서 지원하지 않으므로,
   // 그 틈에 들어온 오디오를 직접 버퍼링했다가 새 세션이 열리자마자 흘려보낸다.
   const pendingAudio = [];
   const MAX_PENDING_AUDIO = 300; // 청크당 ~128ms, 약 38초 분량까지만 보관
+  const MAX_RECONNECT_RETRIES = 3;
 
   const send = (payload) => {
     if (clientWs.readyState === clientWs.OPEN) {
@@ -193,18 +165,49 @@ wss.on("connection", (clientWs) => {
     }
   };
 
-  const onTranscriptEvent = (kind, text) => {
-    if (kind === "user_chunk") userBuffer += text;
-    else if (kind === "model_chunk") modelBuffer += text;
-    else if (kind === "turn_complete") {
-      if (userBuffer.trim()) transcriptTurns.push({ speaker: "고객", text: userBuffer.trim() });
-      if (modelBuffer.trim()) transcriptTurns.push({ speaker: "멘코", text: modelBuffer.trim() });
-      userBuffer = "";
-      modelBuffer = "";
-    }
-  };
+  // 가끔 goAway도, 에러도, close도 없이 세션이 응답을 완전히 멈추는 경우가 있다
+  // (오디오는 계속 보내지는데 인식/응답이 전혀 안 옴). 이런 "먹통" 상태를 감지하기
+  // 위해 Gemini로부터 마지막으로 뭔가(오디오/텍스트/턴완료 등 무엇이든)를 받은
+  // 시각을 기록해두고, 너무 오래 아무 신호가 없으면 세션이 죽었다고 보고 스스로
+  // 새 세션으로 갈아탄다.
+  //
+  // 임계값은 두 가지로 나눈다:
+  // - 사용자가 "지금 실제로 말하고 있는데" 응답이 없으면 명백히 비정상이므로
+  //   짧게(FAST) 기다리고 바로 재연결한다.
+  // - 사용자가 조용한 경우(생각 중일 수도, AI 응답을 듣고만 있을 수도 있음)는
+  //   정상적인 대화 흐름과 구분이 어려우니 좀 더 길게(SLOW) 기다린 뒤에만
+  //   재연결한다 — 너무 짧으면 멀쩡한 침묵 구간에도 불필요하게 재연결이
+  //   발동해 오히려 대화를 방해한다.
+  let lastGeminiMessageAt = Date.now();
+  let lastSpeechAt = 0;
+  const WATCHDOG_CHECK_MS = 1000;
+  const RECENT_SPEECH_WINDOW_MS = 2000;
+  const FAST_STALL_MS = 6000;
+  const SLOW_STALL_MS = 14000;
+  const watchdogTimer = setInterval(() => {
+    if (closedByClient) return;
+    const now = Date.now();
+    const silentFor = now - lastGeminiMessageAt;
+    const userCurrentlySpeaking = now - lastSpeechAt < RECENT_SPEECH_WINDOW_MS;
+    const stallThreshold = userCurrentlySpeaking ? FAST_STALL_MS : SLOW_STALL_MS;
 
-  function connectLive(isReconnect) {
+    if (silentFor > stallThreshold && liveSession) {
+      console.warn(
+        `[Gemini] ${Math.round(silentFor / 1000)}초간 아무 응답이 없어(사용자 발화 중: ${userCurrentlySpeaking}) 세션이 멈춘 것으로 보고 재연결합니다.`
+      );
+      // 그 정도로 오래 응답이 없었다면 이 세션은 신뢰할 수 없다. goAway 때와 달리
+      // 계속 붙잡고 있어봐야 소용없으므로 바로 비워서, 그동안 들어오는 오디오는
+      // pendingAudio에 쌓였다가 새 세션이 열리면 이어서 전달되게 한다.
+      liveSession = null;
+      lastGeminiMessageAt = Date.now(); // 재연결 도중 워치독이 중복 발동하지 않도록
+      // 이 경우는 goAway와 달리 실제로 사용자가 체감할 공백이 있었으므로,
+      // 화면에 상태를 알려 당황해서 여러 번 말하지 않도록 한다.
+      send({ type: "reconnecting" });
+      connectLive(true, 0, true);
+    }
+  }, WATCHDOG_CHECK_MS);
+
+  function connectLive(isReconnect, retryCount = 0, announce = false) {
     // 재연결로 만들어진 세션이 나중에 (예상대로) 닫힐 때는 클라이언트에
     // 에러를 보내지 않기 위한 플래그. goAway를 받으면 즉시 false로 바뀐다.
     let isCurrentSession = true;
@@ -219,24 +222,38 @@ wss.on("connection", (clientWs) => {
         config: buildLiveConfig(resumptionHandle),
         callbacks: {
           onopen: () => {
-            if (!isReconnect) send({ type: "ready" });
-            else console.log("[Gemini] 세션 재연결 완료 (사용자 체감 끊김 없음)");
+            if (!isReconnect) {
+              send({ type: "ready" });
+            } else {
+              console.log("[Gemini] 세션 재연결 완료");
+              if (announce) send({ type: "reconnected" });
+            }
           },
           onmessage: (message) => {
+            lastGeminiMessageAt = Date.now();
             if (message.sessionResumptionUpdate?.resumable && message.sessionResumptionUpdate.newHandle) {
               resumptionHandle = message.sessionResumptionUpdate.newHandle;
             }
             if (message.goAway) {
-              console.log("[Gemini] GoAway 수신 (남은 시간:", message.goAway.timeLeft, ") — 재연결 시도");
+              console.log("[Gemini] GoAway 수신 (남은 시간:", message.goAway.timeLeft, ") — 백그라운드로 재연결 시도");
               isCurrentSession = false;
+              // GoAway는 "지금 끊겨라"가 아니라 "timeLeft 뒤에 끊길 예정"이라는 예고다.
+              // 이 세션은 그때까지 계속 정상 작동하므로 liveSession을 여기서 비우지
+              // 않는다 — 비우면 새 세션이 열릴 때까지 매번 음성이 통째로 멈춰서
+              // 체감 지연이 커진다. 새 세션은 백그라운드로 미리 연결해두고, 완전히
+              // 준비된 순간(.then 콜백)에만 liveSession을 갈아타서 끊김 없이 전환한다.
+              // 혹시라도 새 세션이 열리기 전에 이 세션이 실제로 죽으면(onclose/onerror),
+              // 그때 비로소 liveSession이 비워지고 pendingAudio가 안전망 역할을 한다.
               connectLive(true);
               return;
             }
-            handleGeminiMessage(
-              message,
-              send,
-              (functionResponses) => liveSession?.sendToolResponse({ functionResponses }),
-              onTranscriptEvent
+            // 함수 호출 응답은 반드시 그 호출을 만든 세션(thisSession) 자신에게 돌려줘야
+            // 한다. 공유 변수 liveSession을 쓰면, 마침 이 시점에 GoAway로 재연결이
+            // 시작돼 liveSession이 비워지거나 다른 세션으로 바뀐 경우 응답이 유실되고,
+            // Gemini는 그 함수 호출의 응답을 기다리며 멈춰버린다(마무리 단계에서 자주
+            // 발생하던 "그 뒤로 안 들리는" 증상의 원인).
+            handleGeminiMessage(message, send, (functionResponses) =>
+              thisSession?.sendToolResponse({ functionResponses })
             );
           },
           onerror: (err) => {
@@ -277,6 +294,18 @@ wss.on("connection", (clientWs) => {
       })
       .catch((err) => {
         console.error("Gemini Live 연결 실패:", err?.message || err);
+        if (closedByClient) return;
+
+        if (isReconnect && retryCount < MAX_RECONNECT_RETRIES) {
+          // 재연결이 한 번 실패했다고 바로 세션을 끊지 않는다. 네트워크 순간 오류일 수
+          // 있으니 짧은 대기 후 몇 차례 더 시도하고, 그동안 들어온 오디오는 계속
+          // pendingAudio에 쌓여 있다가 재연결에 성공하면 그대로 이어서 전달된다.
+          const delayMs = 500 * (retryCount + 1);
+          console.log(`[Gemini] 재연결 재시도 (${retryCount + 1}/${MAX_RECONNECT_RETRIES}, ${delayMs}ms 후)`);
+          setTimeout(() => connectLive(true, retryCount + 1, announce), delayMs);
+          return;
+        }
+
         if (isReconnect) {
           send({ type: "error", message: "AI 연결이 끊어져 재연결에 실패했어요. 다시 시작해주세요." });
         } else {
@@ -296,15 +325,8 @@ wss.on("connection", (clientWs) => {
       return;
     }
 
-    if (msg.type === "start") {
-      const age = Number(msg.age);
-      participantInfo = {
-        gender: ["female", "male", "unspecified"].includes(msg.gender) ? msg.gender : "unspecified",
-        age: Number.isFinite(age) && age > 0 && age <= 120 ? age : 0,
-      };
-    }
-
     if (msg.type === "audio") {
+      if (msg.speaking) lastSpeechAt = Date.now();
       const rate = msg.sampleRate || 16000;
       const payload = { audio: { data: msg.data, mimeType: `audio/pcm;rate=${rate}` } };
       if (liveSession) {
@@ -329,15 +351,12 @@ wss.on("connection", (clientWs) => {
 
   clientWs.on("close", () => {
     closedByClient = true;
+    clearInterval(watchdogTimer);
     liveSession?.close();
-    onTranscriptEvent("turn_complete"); // 마지막 턴이 turnComplete 없이 끝났을 경우 대비
-    if (participantInfo && participantInfo.age > 0) {
-      saveSessionToAdmin({ ...participantInfo, transcriptTurns });
-    }
   });
 });
 
-function handleGeminiMessage(message, send, sendToolResponse, onTranscript) {
+function handleGeminiMessage(message, send, sendToolResponse) {
   if (message.toolCall?.functionCalls?.length) {
     const responses = [];
     for (const call of message.toolCall.functionCalls) {
@@ -359,18 +378,15 @@ function handleGeminiMessage(message, send, sendToolResponse, onTranscript) {
   if (sc?.inputTranscription?.text) {
     console.log(`[Gemini] 사용자 발화 인식: ${sc.inputTranscription.text}`);
     send({ type: "userText", text: sc.inputTranscription.text });
-    onTranscript?.("user_chunk", sc.inputTranscription.text);
   }
   if (sc?.outputTranscription?.text) {
     console.log(`[Gemini] 응답 텍스트: ${sc.outputTranscription.text}`);
     send({ type: "modelText", text: sc.outputTranscription.text });
-    onTranscript?.("model_chunk", sc.outputTranscription.text);
   }
   if (sc?.interrupted) {
     send({ type: "interrupted" });
   }
   if (sc?.turnComplete) {
-    onTranscript?.("turn_complete");
     console.log("[Gemini] 턴 완료");
     send({ type: "turnComplete" });
   }

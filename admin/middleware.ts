@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 // 관리자 페이지 전체를 HTTP Basic Auth로 보호한다.
-// 단, server.js가 서버 간 호출로 사용하는 온라인 세션 저장/쿠폰 검증 엔드포인트는
+// 단, server.js가 서버 간 호출로 사용하는 쿠폰 검증 엔드포인트는
 // 자체 토큰(x-internal-token) 인증을 쓰므로 여기서는 제외한다.
 export function middleware(req: NextRequest) {
   const username = process.env.ADMIN_USERNAME;
@@ -32,5 +32,5 @@ export function middleware(req: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!api/offline/online-capture|api/coupons/redeem|_next/static|_next/image|favicon.ico).*)"],
+  matcher: ["/((?!api/coupons/redeem|_next/static|_next/image|favicon.ico).*)"],
 };

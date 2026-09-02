@@ -15,6 +15,7 @@ export async function POST(req: NextRequest) {
   const expiresAt = typeof body?.expiresAt === "string" && body.expiresAt ? body.expiresAt : null;
   const maxUses = Number(body?.maxUses ?? 1);
   const quantity = Number(body?.quantity ?? 1);
+  const customCode = typeof body?.code === "string" && body.code.trim() ? body.code.trim() : undefined;
 
   if (!Number.isFinite(maxUses) || maxUses < 1 || maxUses > 100000) {
     return NextResponse.json({ error: "maxUses는 1~100000 사이여야 합니다." }, { status: 400 });
@@ -23,6 +24,10 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "quantity는 1~200 사이여야 합니다." }, { status: 400 });
   }
 
-  const data = await issueCoupons({ description, expiresAt, maxUses, quantity });
-  return NextResponse.json(data);
+  try {
+    const data = await issueCoupons({ description, expiresAt, maxUses, quantity, customCode });
+    return NextResponse.json(data);
+  } catch (err) {
+    return NextResponse.json({ error: err instanceof Error ? err.message : "쿠폰 발급 실패" }, { status: 400 });
+  }
 }

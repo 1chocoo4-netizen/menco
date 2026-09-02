@@ -3,16 +3,9 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { cn } from "@/lib/utils";
-import { LayoutDashboard, Activity, FileSearch, Download, Sparkles, ClipboardList, Ticket } from "lucide-react";
+import { Sparkles, Ticket } from "lucide-react";
 
-const NAV_ITEMS = [
-  { href: "/", label: "대시보드 요약", icon: LayoutDashboard },
-  { href: "/mental-competency", label: "멘탈 역량 분석", icon: Activity },
-  { href: "/evidence", label: "대화 근거/원문 데이터베이스", icon: FileSearch },
-  { href: "/offline-research", label: "오프라인 연구 데이터", icon: ClipboardList },
-  { href: "/coupons", label: "쿠폰", icon: Ticket },
-  { href: "/export", label: "데이터 Export", icon: Download },
-];
+const NAV_ITEMS = [{ href: "/coupons", label: "쿠폰", icon: Ticket }];
 
 export function Sidebar() {
   const pathname = usePathname();
@@ -25,7 +18,7 @@ export function Sidebar() {
         </div>
         <div>
           <p className="text-sm font-semibold leading-tight text-white">MENCO Admin</p>
-          <p className="text-[11px] leading-tight text-muted">학술 연구 데이터 관리</p>
+          <p className="text-[11px] leading-tight text-muted">쿠폰 관리</p>
         </div>
       </div>
 
@@ -52,8 +45,6 @@ export function Sidebar() {
 
       <div className="border-t border-border px-5 py-4 text-[11px] text-muted">
         숭실대학교 커리어학습코칭 연구소
-        <br />
-        멘탈력 효과 검증 연구
       </div>
     </aside>
   );

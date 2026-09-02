@@ -74,11 +74,41 @@ export function issueCoupons(input: {
   expiresAt: string | null;
   maxUses: number;
   quantity: number;
+  /** 관리자가 직접 지정하는 코드. 지정 시 quantity는 반드시 1이어야 한다. */
+  customCode?: string;
 }): Promise<Coupon[]> {
   return withLock(async () => {
     const data = await readCoupons();
     const existingCodes = new Set(data.map((c) => c.code));
     const now = new Date().toISOString();
+
+    if (input.customCode) {
+      if (input.quantity !== 1) {
+        throw new Error("직접 지정한 코드는 한 번에 1개만 발급할 수 있습니다.");
+      }
+      const code = input.customCode.trim().replace(/\s+/g, " ").toUpperCase();
+      if (!code) {
+        throw new Error("코드를 입력해주세요.");
+      }
+      if (code.length > 40) {
+        throw new Error("코드는 40자 이내로 입력해주세요.");
+      }
+      if (existingCodes.has(code)) {
+        throw new Error("이미 사용 중인 코드입니다.");
+      }
+      data.push({
+        id: genId(),
+        code,
+        description: input.description.trim(),
+        maxUses: input.maxUses,
+        usedCount: 0,
+        expiresAt: input.expiresAt,
+        status: "active",
+        createdAt: now,
+      });
+      await writeCoupons(data);
+      return data;
+    }
 
     for (let i = 0; i < input.quantity; i++) {
       let code = genCode();
@@ -116,7 +146,7 @@ export type RedeemResult = { ok: true } | { ok: false; error: string };
 
 export function redeemCoupon(rawCode: string): Promise<RedeemResult> {
   return withLock(async () => {
-    const code = rawCode.trim().toUpperCase();
+    const code = rawCode.trim().replace(/\s+/g, " ").toUpperCase();
     const data = await readCoupons();
     const coupon = data.find((c) => c.code === code);
 

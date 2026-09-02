@@ -1,3 +1,6 @@
+// 마이크 RMS가 이 값을 넘으면 "말하는 중"으로 간주한다 (배경 잡음보다는 확실히 크게).
+const SPEECH_RMS_THRESHOLD = 0.02;
+
 const micButton = document.getElementById("micButton");
 const statusEl = document.getElementById("status");
 const bodyEl = document.body;
@@ -185,6 +188,10 @@ async function startMicCapture() {
         type: "audio",
         data: int16ToBase64(int16),
         sampleRate: actualRate,
+        // 서버가 "사용자가 지금 말하는 중인데 AI가 반응이 없는" 진짜 먹통과,
+        // 단순히 사용자가 생각하느라 조용한 정상 상황을 구분할 수 있도록
+        // 대략적인 발화 여부를 같이 보낸다.
+        speaking: rms > SPEECH_RMS_THRESHOLD,
       })
     );
     chunkCount++;
@@ -243,6 +250,14 @@ function connect() {
       case "interrupted":
         stopPlayback();
         setState("listening", "듣고 있어요...");
+        break;
+      case "reconnecting":
+        // 서버가 백그라운드에서 AI 세션을 다시 연결하는 중. 마이크와 연결은
+        // 그대로 유지되니 계속 말씀하셔도 되고, 잠시 후 자동으로 이어집니다.
+        setState("connecting", "연결이 잠시 불안정해요. 다시 연결하고 있어요...");
+        break;
+      case "reconnected":
+        if (sessionActive) setState("listening", "다시 연결됐어요. 계속 말씀해주세요.");
         break;
       case "userText":
         break;
