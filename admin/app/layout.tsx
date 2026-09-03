@@ -3,8 +3,8 @@ import "./globals.css";
 import { Sidebar } from "@/components/layout/Sidebar";
 
 export const metadata: Metadata = {
-  title: "멘코 어드민 · 쿠폰 관리",
-  description: "AI 멘탈코치 멘코의 이용 쿠폰을 발급·관리하는 어드민 페이지",
+  title: "멘코 어드민",
+  description: "AI 멘탈코치 멘코의 관리자 페이지",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

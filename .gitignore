@@ -5,4 +5,3 @@ admin/.next/
 admin/next-env.d.ts
 admin/.env*.local
 admin/data/offline-research.json
-admin/data/coupons.json

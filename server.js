@@ -12,9 +12,6 @@ const LIVE_MODEL = process.env.GEMINI_LIVE_MODEL || "gemini-2.5-flash-native-aud
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-const ADMIN_API_URL = process.env.ADMIN_API_URL;
-const INTERNAL_API_TOKEN = process.env.INTERNAL_API_TOKEN;
-
 const SYSTEM_PROMPT = `너는 '멘코(MentCo)'라는 이름의 전문 멘탈 코치 AI야.
 국제코치연맹(ICF) MCC 수준의 코칭 역량과 한국코치협회(KCA) KSC 자격의 코칭 철학을 체화한,
 유연하고 노련한 세계 최고 수준의 전문 코치처럼 대화해.
@@ -72,33 +69,6 @@ const SYSTEM_PROMPT = `너는 '멘코(MentCo)'라는 이름의 전문 멘탈 코
 
 app.use(express.static("public"));
 app.use(express.json());
-
-app.post("/api/coupon/redeem", async (req, res) => {
-  const code = typeof req.body?.code === "string" ? req.body.code : "";
-  if (!code.trim()) {
-    return res.status(400).json({ ok: false, error: "쿠폰 코드를 입력해주세요." });
-  }
-  if (!ADMIN_API_URL || !INTERNAL_API_TOKEN) {
-    console.error("[쿠폰 검증] ADMIN_API_URL/INTERNAL_API_TOKEN 미설정");
-    return res.status(503).json({ ok: false, error: "쿠폰 확인 서비스를 사용할 수 없어요. 잠시 후 다시 시도해주세요." });
-  }
-
-  try {
-    const adminRes = await fetch(`${ADMIN_API_URL}/api/coupons/redeem`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-internal-token": INTERNAL_API_TOKEN,
-      },
-      body: JSON.stringify({ code }),
-    });
-    const body = await adminRes.json().catch(() => ({ ok: false, error: "쿠폰 확인 중 오류가 발생했어요." }));
-    return res.status(adminRes.ok ? 200 : 400).json(body);
-  } catch (err) {
-    console.error("[쿠폰 검증] admin 연결 실패:", err?.message || err);
-    return res.status(503).json({ ok: false, error: "쿠폰 확인 서비스에 연결할 수 없어요. 잠시 후 다시 시도해주세요." });
-  }
-});
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/live" });
@@ -158,6 +128,15 @@ wss.on("connection", (clientWs) => {
   const pendingAudio = [];
   const MAX_PENDING_AUDIO = 300; // 청크당 ~128ms, 약 38초 분량까지만 보관
   const MAX_RECONNECT_RETRIES = 3;
+  // 재연결로 새 세션이 열려도 옛 세션은 자기 턴을 마저 끝내도록 살려두는데(아래
+  // connectLive 주석 참고), onmessage는 어느 세션에서 왔든 그대로 클라이언트에
+  // 전달했었다. 그래서 옛 세션이 마무리 발화를 하는 도중 새 세션이 벌써 자기
+  // 응답을 시작하면 두 세션의 오디오가 동시에 섞여 들어가 "목소리가 갈라지는"
+  // 현상이 났다(재연결이 누적되는 대화 후반부일수록 심해짐). connectLive 호출마다
+  // 세대 번호를 매기고, 더 최신 세대가 실제로 메시지를 보내기 시작하는 순간부터
+  // 그보다 오래된 세대의 메시지는 버려서 두 세션의 출력이 겹치지 않게 한다.
+  let nextSessionGeneration = 0;
+  let activeSessionGeneration = -1;
 
   const send = (payload) => {
     if (clientWs.readyState === clientWs.OPEN) {
@@ -215,6 +194,7 @@ wss.on("connection", (clientWs) => {
     // liveSession(바깥 변수)은 재연결 과정에서 다른 세션으로 바뀔 수 있으므로,
     // onclose에서 "내가 여전히 현재 세션인지"를 판단하려면 이 참조가 필요하다.
     let thisSession = null;
+    const myGeneration = nextSessionGeneration++;
 
     ai.live
       .connect({
@@ -247,6 +227,21 @@ wss.on("connection", (clientWs) => {
               connectLive(true);
               return;
             }
+            // 더 최신 세대가 이미 응답을 시작했다면, 뒤늦게 도착한 옛 세대의 메시지는
+            // 버린다 — 그대로 흘려보내면 두 세션의 오디오가 겹쳐 들린다. 승격은 실제
+            // 오디오/텍스트 등 내용이 있는 메시지에서만 일어나게 해서, 내용 없는
+            // 부수 메시지(세션 재개 핸들 갱신 등) 때문에 옛 세션이 말을 채 끝내기도
+            // 전에 조기 차단되는 일이 없게 한다.
+            if (myGeneration < activeSessionGeneration) return;
+            const hasContent =
+              !!message.data ||
+              !!message.toolCall?.functionCalls?.length ||
+              !!message.serverContent?.inputTranscription?.text ||
+              !!message.serverContent?.outputTranscription?.text ||
+              !!message.serverContent?.interrupted ||
+              !!message.serverContent?.turnComplete;
+            if (hasContent) activeSessionGeneration = myGeneration;
+
             // 함수 호출 응답은 반드시 그 호출을 만든 세션(thisSession) 자신에게 돌려줘야
             // 한다. 공유 변수 liveSession을 쓰면, 마침 이 시점에 GoAway로 재연결이
             // 시작돼 liveSession이 비워지거나 다른 세션으로 바뀐 경우 응답이 유실되고,
@@ -370,7 +365,6 @@ function handleGeminiMessage(message, send, sendToolResponse) {
   }
 
   if (message.data) {
-    console.log(`[Gemini] 오디오 청크 수신 (${message.data.length}자 base64)`);
     send({ type: "audio", data: message.data });
   }
 
