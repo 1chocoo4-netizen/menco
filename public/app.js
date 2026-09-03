@@ -136,7 +136,9 @@ async function startMicCapture() {
   console.log(`[마이크] 입력 오디오 컨텍스트 sampleRate: ${actualRate}`);
 
   inputSourceNode = inputAudioContext.createMediaStreamSource(micStream);
-  processorNode = inputAudioContext.createScriptProcessor(2048, 1, 1);
+  // Gemini Live API는 지연을 줄이려면 20~40ms 단위로 오디오를 보내라고 권장한다.
+  // 16kHz에서 512샘플 = 32ms.
+  processorNode = inputAudioContext.createScriptProcessor(512, 1, 1);
 
   const silentGain = inputAudioContext.createGain();
   silentGain.gain.value = 0;
@@ -164,7 +166,7 @@ async function startMicCapture() {
       })
     );
     chunkCount++;
-    if (chunkCount % 10 === 0) console.log(`[마이크] ${chunkCount}개 청크 전송됨, RMS: ${rms.toFixed(4)}`);
+    if (chunkCount % 40 === 0) console.log(`[마이크] ${chunkCount}개 청크 전송됨, RMS: ${rms.toFixed(4)}`);
   };
 
   inputSourceNode.connect(processorNode);

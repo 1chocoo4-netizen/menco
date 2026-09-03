@@ -126,7 +126,7 @@ wss.on("connection", (clientWs) => {
   // transparent 재연결은 Gemini API(Vertex 전용 기능)에서 지원하지 않으므로,
   // 그 틈에 들어온 오디오를 직접 버퍼링했다가 새 세션이 열리자마자 흘려보낸다.
   const pendingAudio = [];
-  const MAX_PENDING_AUDIO = 300; // 청크당 ~128ms, 약 38초 분량까지만 보관
+  const MAX_PENDING_AUDIO = 1200; // 청크당 ~32ms, 약 38초 분량까지만 보관
   const MAX_RECONNECT_RETRIES = 3;
   // 재연결로 새 세션이 열려도 옛 세션은 자기 턴을 마저 끝내도록 살려두는데(아래
   // connectLive 주석 참고), onmessage는 어느 세션에서 왔든 그대로 클라이언트에
@@ -150,21 +150,36 @@ wss.on("connection", (clientWs) => {
   // 시각을 기록해두고, 너무 오래 아무 신호가 없으면 세션이 죽었다고 보고 스스로
   // 새 세션으로 갈아탄다.
   //
-  // 임계값은 두 가지로 나눈다:
+  // 단, 재연결은 세션 리줌 체크포인트 이후의 최근 대화가 유실될 위험을 안고 있으므로
+  // (Gemini Live API 공식 문서에도 명시된 한계) 꼭 필요할 때만 해야 한다. 그런데
+  // 이 코치는 시스템 프롬프트에서부터 "고객이 스스로 채울 여백을 남긴다"며 질문 뒤에
+  // 긴 침묵을 의도적으로 유도한다 — 즉 사용자가 10초 넘게 생각하며 조용히 있는 건
+  // 코칭 세션에서 지극히 정상이다. 그런데 아래 워치독은 "Gemini가 마지막으로 뭔가
+  // 보낸 시점"부터만 재는데, AI가 질문을 던지고 turnComplete를 보낸 직후부터도 이
+  // 타이머가 흐르기 시작한다. 그래서 사용자가 그 여백 동안 정상적으로 침묵하면
+  // "먹통"으로 오판해 불필요하게 재연결시키고, 그때마다 최근 대화가 유실될 위험을
+  // 감수하게 된다 — 대화가 길어질수록 그런 침묵 구간을 만날 확률이 누적되니 "뒤로
+  // 갈수록 못 알아듣는다"는 증상으로 나타난 근본 원인이었다.
+  //
+  // 그래서 "지금 Gemini의 응답을 실제로 기다리고 있는 상태"일 때만 감시한다:
+  // 사용자가 말하기 시작하면 감시를 켜고, Gemini가 그 턴을 완결(turnComplete)하면
+  // 다시 끈다. AI가 다음 말을 걸 차례가 아니라 사용자 차례일 때는 아무리 조용해도
+  // 절대 재연결하지 않는다.
+  //
+  // 감시 중일 때의 임계값은 두 가지로 나눈다:
   // - 사용자가 "지금 실제로 말하고 있는데" 응답이 없으면 명백히 비정상이므로
   //   짧게(FAST) 기다리고 바로 재연결한다.
-  // - 사용자가 조용한 경우(생각 중일 수도, AI 응답을 듣고만 있을 수도 있음)는
-  //   정상적인 대화 흐름과 구분이 어려우니 좀 더 길게(SLOW) 기다린 뒤에만
-  //   재연결한다 — 너무 짧으면 멀쩡한 침묵 구간에도 불필요하게 재연결이
-  //   발동해 오히려 대화를 방해한다.
+  // - 사용자가 말을 막 끝내고 Gemini의 응답 생성을 기다리는 중이면 약간 더 길게
+  //   (SLOW) 기다린 뒤에만 재연결한다.
   let lastGeminiMessageAt = Date.now();
   let lastSpeechAt = 0;
+  let awaitingReply = false;
   const WATCHDOG_CHECK_MS = 1000;
   const RECENT_SPEECH_WINDOW_MS = 2000;
   const FAST_STALL_MS = 6000;
   const SLOW_STALL_MS = 14000;
   const watchdogTimer = setInterval(() => {
-    if (closedByClient) return;
+    if (closedByClient || !awaitingReply) return;
     const now = Date.now();
     const silentFor = now - lastGeminiMessageAt;
     const userCurrentlySpeaking = now - lastSpeechAt < RECENT_SPEECH_WINDOW_MS;
@@ -241,6 +256,9 @@ wss.on("connection", (clientWs) => {
               !!message.serverContent?.interrupted ||
               !!message.serverContent?.turnComplete;
             if (hasContent) activeSessionGeneration = myGeneration;
+            // Gemini가 이번 턴을 완결하면 다시 사용자 차례이므로, 사용자가 다음에
+            // 말을 시작하기 전까지는(아래 clientWs.on("message")) 워치독을 끈다.
+            if (message.serverContent?.turnComplete) awaitingReply = false;
 
             // 함수 호출 응답은 반드시 그 호출을 만든 세션(thisSession) 자신에게 돌려줘야
             // 한다. 공유 변수 liveSession을 쓰면, 마침 이 시점에 GoAway로 재연결이
@@ -321,7 +339,12 @@ wss.on("connection", (clientWs) => {
     }
 
     if (msg.type === "audio") {
-      if (msg.speaking) lastSpeechAt = Date.now();
+      if (msg.speaking) {
+        lastSpeechAt = Date.now();
+        // 사용자가 말을 시작했으니 이제부터 Gemini의 응답을 기다리는 구간이다.
+        // 워치독은 이 시점부터 다음 turnComplete까지만 감시한다.
+        awaitingReply = true;
+      }
       const rate = msg.sampleRate || 16000;
       const payload = { audio: { data: msg.data, mimeType: `audio/pcm;rate=${rate}` } };
       if (liveSession) {
@@ -338,7 +361,7 @@ wss.on("connection", (clientWs) => {
         if (pendingAudio.length > MAX_PENDING_AUDIO) pendingAudio.shift();
       }
       receivedChunks++;
-      if (receivedChunks % 20 === 0) {
+      if (receivedChunks % 80 === 0) {
         console.log(`[클라이언트] 오디오 ${receivedChunks}청크 전달 (rate=${rate})`);
       }
     }
