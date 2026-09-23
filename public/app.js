@@ -46,29 +46,33 @@ let micStream = null;
 let remoteAudio = null;
 let levelContext = null;
 let levelFrame = null;
-let pacingTimer = null;
 
-// 음성 AI는 시간이 얼마나 흘렀는지 스스로 알 수 없어서, 코칭을 몇 번 주고받다 서둘러 끝내버리곤
-// 한다. 5분마다 경과 시간을 (말하지 않는) 시스템 메모로 알려줘서 20~30분 세션의 속도를 조절하게 한다.
-const PACING_INTERVAL_MIN = 5;
+// 음성 AI는 시간이 얼마나 흘렀는지 스스로 알 수 없어서, 코칭을 너무 서둘러 끝내거나 반대로
+// 끝없이 끌곤 한다. 정해진 시점마다 경과 시간을 (말하지 않는) 시스템 메모로 알려줘서
+// 한 세션이 8~15분 안에 끝나도록 속도를 조절하게 한다.
+const PACING_NOTES = [
+  { min: 3, hint: "아직 현재 탐색 단계다. 대안이나 실행 계획으로 넘어가지 말고 감정·자기대화·가치를 깊이 탐색한다." },
+  { min: 6, hint: "이제 대안 탐색으로 넘어가도 된다. 고객의 통찰을 확인한 뒤 대안으로 이끈다." },
+  { min: 8, hint: "실행 계획으로 넘어갈 시점이다. 실행 계획과 의지가 확인되면 마무리해도 된다." },
+  { min: 11, hint: "아직 실행 계획 중이라면 핵심(무엇을, 언제, 실행 의지)만 확정하고 마무리로 넘어간다." },
+  { min: 13, hint: "마무리할 시점이다. 오늘 얻은 것을 묻고 응원으로 마무리한다." },
+  { min: 15, hint: "세션 시간이 다 됐다. 지금 바로 마무리한다." },
+];
+let pacingTimers = [];
 
 function startPacingNotes() {
-  let elapsedMin = 0;
-  pacingTimer = setInterval(() => {
-    elapsedMin += PACING_INTERVAL_MIN;
-    let hint;
-    if (elapsedMin < 15) hint = "아직 세션 초중반이다. 서두르지 말고 현재 단계에서 충분히 깊이 탐색한다.";
-    else if (elapsedMin < 25) hint = "세션 중후반이다. 대안 탐색과 실행 계획으로 자연스럽게 나아간다.";
-    else hint = "세션 후반이다. 실행 의지를 확인하고 마무리 단계로 이끈다.";
-    sendEvent({
-      type: "conversation.item.create",
-      item: {
-        type: "message",
-        role: "system",
-        content: [{ type: "input_text", text: `[진행 시간 안내 — 고객에게 말하지 말 것] 코칭 시작 후 약 ${elapsedMin}분 경과. ${hint}` }],
-      },
-    });
-  }, PACING_INTERVAL_MIN * 60 * 1000);
+  pacingTimers = PACING_NOTES.map(({ min, hint }) =>
+    setTimeout(() => {
+      sendEvent({
+        type: "conversation.item.create",
+        item: {
+          type: "message",
+          role: "system",
+          content: [{ type: "input_text", text: `[진행 시간 안내 — 고객에게 말하지 말 것] 코칭 시작 후 약 ${min}분 경과. ${hint}` }],
+        },
+      });
+    }, min * 60 * 1000)
+  );
 }
 
 function setState(state, message) {
@@ -126,6 +130,15 @@ function handleServerEvent(event) {
       });
       break;
     case "response.done": {
+      // OpenAI 계정의 분당 토큰 한도(TPM)에 걸리면 응답이 실패하고 AI가 그냥 침묵한다.
+      // 안내된 대기 시간만큼 기다렸다가 같은 응답을 다시 요청한다.
+      const error = event.response?.status_details?.error;
+      if (event.response?.status === "failed" && error?.code === "rate_limit_exceeded") {
+        const waitSec = Number(/try again in ([\d.]+)s/.exec(error.message || "")?.[1]) || 3;
+        console.warn(`[멘코] 사용량 한도에 걸려 ${waitSec}초 뒤 응답을 다시 요청합니다.`);
+        setTimeout(() => sendEvent({ type: "response.create" }), (waitSec + 0.5) * 1000);
+        break;
+      }
       const output = event.response?.output ?? [];
       const hadFunctionCall = output.some((item) => item.type === "function_call" && item.call_id === wrapUpCallId);
       const hadSpeech = output.some((item) => item.type === "message");
@@ -209,8 +222,8 @@ async function startSession() {
 
 function endSession(message = "버튼을 누르고 멘탈 코칭 대화를 시작해 보세요") {
   sessionActive = false;
-  clearInterval(pacingTimer);
-  pacingTimer = null;
+  pacingTimers.forEach(clearTimeout);
+  pacingTimers = [];
   if (levelFrame) cancelAnimationFrame(levelFrame);
   levelFrame = null;
   updateMicLevel(0);
