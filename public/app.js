@@ -1,5 +1,17 @@
 // 마이크 RMS가 이 값을 넘으면 "말하는 중"으로 간주한다 (배경 잡음보다는 확실히 크게).
 const SPEECH_RMS_THRESHOLD = 0.02;
+// AI 목소리가 스피커로 나오는 동안에는 그 소리가 마이크로 다시 들어가(에코) Gemini가
+// 자기 목소리를 사용자 말로 착각한다 — 스스로 말을 끊어 목소리가 뚝뚝 갈라지고, 자기
+// 말에 대답하느라 대화가 점점 이상해진다(구글도 헤드폰 사용을 권장하는 알려진 문제).
+// 그래서 AI 음성 재생 중에는 마이크 대신 무음을 보내고, 사용자가 이 크기 이상으로
+// BARGE_IN_CHUNKS만큼(약 0.25초) 계속 말할 때만 끼어들기로 인정해 마이크를 연다.
+const BARGE_IN_RMS_THRESHOLD = 0.07;
+const BARGE_IN_CHUNKS = 8;
+// 재생이 끝난 뒤에도 스피커 잔향이 잠깐 남으므로 이만큼 더 무음 처리한다.
+const ECHO_TAIL_SEC = 0.3;
+// 네트워크로 오는 음성 조각 사이가 조금만 벌어져도 "틱틱" 끊기지 않도록, 새로 재생을
+// 시작할 때 이만큼 여유를 두고 시작한다.
+const PLAYBACK_JITTER_SEC = 0.08;
 
 const micButton = document.getElementById("micButton");
 const statusEl = document.getElementById("status");
@@ -68,13 +80,6 @@ function base64ToInt16(base64) {
   return new Int16Array(bytes.buffer);
 }
 
-function int16ToBase64(int16Array) {
-  const bytes = new Uint8Array(int16Array.buffer);
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary);
-}
-
 function floatTo16BitPCM(float32Array) {
   const int16 = new Int16Array(float32Array.length);
   for (let i = 0; i < float32Array.length; i++) {
@@ -99,7 +104,7 @@ function playAudioChunk(base64Data) {
   source.connect(outputAudioContext.destination);
 
   const now = outputAudioContext.currentTime;
-  const startTime = Math.max(now, nextStartTime);
+  const startTime = nextStartTime > now ? nextStartTime : now + PLAYBACK_JITTER_SEC;
   source.start(startTime);
   nextStartTime = startTime + buffer.duration;
 
@@ -126,8 +131,16 @@ function stopPlayback() {
   if (outputAudioContext) nextStartTime = outputAudioContext.currentTime;
 }
 
+// AI 음성이 (잔향 포함) 아직 스피커에서 나오고 있는지.
+function isAiAudible() {
+  if (!outputAudioContext) return false;
+  return activeSources.size > 0 || nextStartTime + ECHO_TAIL_SEC > outputAudioContext.currentTime;
+}
+
 async function startMicCapture() {
-  micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+  });
 
   inputAudioContext = new AudioContext({ sampleRate: 16000 });
   if (inputAudioContext.state === "suspended") await inputAudioContext.resume();
@@ -143,7 +156,12 @@ async function startMicCapture() {
   const silentGain = inputAudioContext.createGain();
   silentGain.gain.value = 0;
 
+  ws.send(JSON.stringify({ type: "mic", sampleRate: actualRate }));
+
   let chunkCount = 0;
+  let loudChunks = 0;
+  let bargedIn = false;
+  const recentChunks = []; // 끼어들기 인정 전까지 막아둔 최근 마이크 소리 (말 앞부분 보존)
   processorNode.onaudioprocess = (event) => {
     const input = event.inputBuffer.getChannelData(0);
 
@@ -154,19 +172,38 @@ async function startMicCapture() {
 
     if (!sessionActive || !ws || ws.readyState !== WebSocket.OPEN) return;
     const int16 = floatTo16BitPCM(input);
-    ws.send(
-      JSON.stringify({
-        type: "audio",
-        data: int16ToBase64(int16),
-        sampleRate: actualRate,
-        // 서버가 "사용자가 지금 말하는 중인데 AI가 반응이 없는" 진짜 먹통과,
-        // 단순히 사용자가 생각하느라 조용한 정상 상황을 구분할 수 있도록
-        // 대략적인 발화 여부를 같이 보낸다.
-        speaking: rms > SPEECH_RMS_THRESHOLD,
-      })
-    );
+
+    // 서버로는 [1바이트 발화 플래그][16비트 PCM] 바이너리 프레임을 보낸다
+    // (JSON+base64보다 브라우저·서버 CPU를 훨씬 덜 쓴다).
+    const sendFrame = (pcm, speaking) => {
+      const frame = new Uint8Array(1 + pcm.byteLength);
+      frame[0] = speaking ? 1 : 0;
+      frame.set(new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength), 1);
+      ws.send(frame.buffer);
+    };
+
+    if (isAiAudible() && !bargedIn) {
+      loudChunks = rms > BARGE_IN_RMS_THRESHOLD ? loudChunks + 1 : 0;
+      recentChunks.push(int16);
+      if (recentChunks.length > BARGE_IN_CHUNKS) recentChunks.shift();
+      if (loudChunks >= BARGE_IN_CHUNKS) {
+        // 사용자가 AI 말 중간에 분명히 끼어들었다: 막아뒀던 앞부분부터 그대로 보낸다.
+        bargedIn = true;
+        for (const pcm of recentChunks) sendFrame(pcm, true);
+        recentChunks.length = 0;
+      } else {
+        sendFrame(new Int16Array(int16.length), false);
+      }
+    } else {
+      if (!isAiAudible()) bargedIn = false;
+      loudChunks = 0;
+      recentChunks.length = 0;
+      // 서버가 "사용자가 말하는데 AI가 반응이 없는" 진짜 먹통을 감지할 수 있도록
+      // 대략적인 발화 여부를 같이 보낸다.
+      sendFrame(int16, rms > SPEECH_RMS_THRESHOLD);
+    }
     chunkCount++;
-    if (chunkCount % 40 === 0) console.log(`[마이크] ${chunkCount}개 청크 전송됨, RMS: ${rms.toFixed(4)}`);
+    if (chunkCount % 300 === 0) console.log(`[마이크] ${chunkCount}개 청크 전송됨, RMS: ${rms.toFixed(4)}`);
   };
 
   inputSourceNode.connect(processorNode);

@@ -73,10 +73,39 @@ app.use(express.json());
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/live" });
 
-function buildLiveConfig(resumptionHandle) {
+// ─────────────────────────────────────────────────────────────────────────────
+// 세션 운용 방식 (2026-09-24 재설계)
+//
+// 증상: 코칭 시작 후 약 3분이 지나면 목소리가 갈라지고 점점 이상해지다가, 결국 사용자
+// 말을 못 알아듣고 "듣고 있어요 ↔ 다시 연결됐어요"를 무한 반복했다.
+//
+// 근본 원인은 재연결 로직이 아니라 Gemini 네이티브 오디오 모델 자체의 알려진 문제다:
+// 한 Live 세션 안에 오디오 컨텍스트가 쌓일수록(1~3분부터) 응답 지연이 급격히 늘고,
+// 발화가 중간에 끊기거나 음성이 깨진다(구글 포럼/GitHub 이슈에 재현·보고됨, 미해결).
+// 예전 코드는 여기에 기름을 부었다:
+//  - 느려진 응답을 워치독이 "먹통"으로 보고 재연결 → 세션 재개 핸들로 "이미 망가진
+//    그 오디오 컨텍스트"를 그대로 복원 → 여전히 느림 → 또 재연결… 무한 반복.
+//  - 사용자 발화 인식(inputTranscription)만 와도 재시도 카운터를 0으로 되돌려서
+//    MAX_RECONNECT_ATTEMPTS 상한이 사실상 무력화됐다.
+//  - 재개 핸들을 버릴 때는 대화 맥락이 통째로 사라져 "내 말을 못 알아듣는" 상태가 됐다.
+//
+// 새 방식:
+//  1) 대화 내용을 서버가 직접 텍스트로 기록한다(입·출력 음성 인식 결과).
+//  2) 한 세션이 ROTATE_AFTER_MS를 넘기면, 사용자 차례의 조용한 순간에 새 세션을
+//     백그라운드로 열고 "지금까지의 대화 기록(텍스트)"을 넣어 이어받게 한 뒤 교체한다.
+//     텍스트 맥락은 오디오 맥락보다 훨씬 가벼워서 새 세션은 항상 처음처럼 빠르고 깨끗하다.
+//     사용자에게는 아무 안내도 뜨지 않는다(끊김 없는 교체).
+//  3) 장애로 인한 복구 재연결도 같은 방식(텍스트 기록 인계)을 쓴다. 세션 재개 핸들과
+//     슬라이딩 윈도우 압축은 더 이상 쓰지 않는다 — 세션이 짧게 유지되므로 필요 없고,
+//     압축은 오히려 발화 끊김을 악화시킨다고 보고돼 있다.
+//  4) 재시도 카운터는 "모델이 실제로 말을 했을 때"만 리셋한다. 그래서 복구가 계속
+//     실패하면 무한 루프 대신 명확한 안내와 함께 끝난다.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function buildLiveConfig(systemInstruction) {
   return {
     responseModalities: [Modality.AUDIO],
-    systemInstruction: SYSTEM_PROMPT,
+    systemInstruction,
     speechConfig: {
       languageCode: "ko-KR",
       voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } },
@@ -99,68 +128,108 @@ function buildLiveConfig(resumptionHandle) {
         startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
         endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
         // 짧은 잡음/숨소리에 반응하지 않도록, 이만큼 지속된 소리만 "발화 시작"으로 인정.
-        // HIGH 민감도의 빠른 반응성은 유지하면서 바지인 오탐만 걸러낸다.
         prefixPaddingMs: 200,
         silenceDurationMs: 400,
       },
     },
-    // 오디오는 텍스트보다 토큰을 훨씬 빨리 소모해서, 이걸 켜지 않으면 몇 분 만에
-    // 컨텍스트 윈도우 한도에 도달해 세션이 강제 종료된다. 슬라이딩 윈도우로
-    // 오래된 대화를 자동 압축해 장시간 세션이 끊기지 않게 한다.
-    contextWindowCompression: {
-      slidingWindow: {},
-    },
-    // Live API 연결 자체가 일정 시간 후 GoAway와 함께 강제 종료되는데,
-    // 세션 재개를 켜두면 handle을 받아뒀다가 끊기기 직전 조용히 재연결할 수 있다.
-    sessionResumption: resumptionHandle ? { handle: resumptionHandle } : {},
   };
 }
 
+// 새 세션에 넘기는 대화 기록의 최대 길이. 앞부분(오늘의 주제·목표 합의)은 코칭에서
+// 특히 중요하므로 넘칠 때도 앞 TRANSCRIPT_HEAD_CHARS만큼은 남기고 중간을 줄인다.
+const TRANSCRIPT_MAX_CHARS = 24000;
+const TRANSCRIPT_HEAD_CHARS = 3000;
+
+function formatTranscript(entries) {
+  let text = entries
+    .map((e) => `${e.role === "user" ? "고객" : "멘코"}: ${e.text.trim()}`)
+    .join("\n");
+  if (text.length > TRANSCRIPT_MAX_CHARS) {
+    text =
+      text.slice(0, TRANSCRIPT_HEAD_CHARS) +
+      "\n…(중략)…\n" +
+      text.slice(-(TRANSCRIPT_MAX_CHARS - TRANSCRIPT_HEAD_CHARS));
+  }
+  return text;
+}
+
+function buildSystemInstruction(entries, wrapUpCalled) {
+  if (entries.length === 0) return SYSTEM_PROMPT;
+  return `${SYSTEM_PROMPT}
+
+[진행 중인 대화 — 그대로 이어가기]
+이 코칭 대화는 이미 진행 중이다. 아래는 지금까지 고객과 나눈 대화 기록이다(음성 인식
+결과라 오탈자가 있을 수 있으니 맥락으로 이해한다). 처음 만난 것처럼 인사하거나
+자기소개하지 말고, 대화가 끊긴 적이 있다는 언급도 하지 말고, 이 흐름을 자연스럽게 이어간다.
+먼저 말을 꺼내지 말고 고객의 다음 말을 기다렸다가 이어서 답한다.${
+    wrapUpCalled ? "\nmark_coaching_wrap_up 함수는 이미 호출했으므로 다시 호출하지 않는다." : ""
+  }
+---
+${formatTranscript(entries)}
+---`;
+}
+
+// 한 세션을 이 시간 이상 쓰면, 다음 조용한 순간에 새 세션으로 교체한다.
+// 증상이 약 3분부터 나타났으므로 그보다 충분히 앞에서 교체한다.
+const ROTATE_AFTER_MS = 100_000;
+// 교체에 실패하면(연결 실패 등) 기존 세션을 계속 쓰다가 이 시간 뒤에 다시 시도한다.
+const ROTATE_RETRY_MS = 10_000;
+// 사용자가 마지막으로 말한 뒤 이만큼 조용해야 "교체해도 안전한 순간"으로 본다.
+const QUIET_BEFORE_ROTATE_MS = 1500;
+// 새 세션이 이 시간 안에 준비(setupComplete)되지 않으면 실패로 본다.
+const CONNECT_TIMEOUT_MS = 10_000;
+// 복구 재연결이 이 시간보다 오래 걸릴 때만 클라이언트에 "재연결 중" 안내를 띄운다.
+const ANNOUNCE_RECONNECT_AFTER_MS = 1500;
+const MAX_RECONNECT_ATTEMPTS = 5;
+
+// 워치독 기준
+// A) Gemini가 사용자 말을 인식(inputTranscription)했는데 그 뒤로 이만큼 아무 응답이 없음.
+const REPLY_STALL_MS = 12_000;
+// B) 사용자가 계속 말하는데(클라이언트 발화 플래그) Gemini가 이만큼 아무 메시지도 안 보냄.
+const DEAF_STALL_MS = 10_000;
+const DEAF_MIN_SPEECH_CHUNKS = 90; // 32ms 청크 기준 약 3초 분량의 발화
+const WATCHDOG_CHECK_MS = 1000;
+
+// 연결이 끊긴 동안 쌓아둘 사용자 오디오(32ms 청크 기준 약 10초). 그보다 오래된
+// 소리는 이미 맥락상 의미가 없고, 새 세션에 한꺼번에 밀어넣으면 응답만 늦어진다.
+const MAX_PENDING_AUDIO = 310;
+
 wss.on("connection", (clientWs) => {
   console.log("[클라이언트] 연결됨");
-  let liveSession = null;
   let closedByClient = false;
+  let inputSampleRate = 16000;
   let receivedChunks = 0;
-  let resumptionHandle = null;
+
+  // 대화 기록(텍스트). 같은 화자의 연속 발화는 한 항목으로 합친다.
+  const transcript = [];
+  let wrapUpCalled = false;
+
+  // 현재 사용자 오디오를 받는 세션. currentSessionId가 아닌 세션의 메시지는 전부 버린다
+  // — 교체/복구 시 옛 세션과 새 세션의 소리가 섞이는 일이 구조적으로 불가능하다.
+  let liveSession = null;
+  let currentSessionId = 0;
+  let sessionStartedAt = 0;
+  let nextSessionId = 1;
+  // 가장 최근에 시작한 연결 시도. 이보다 오래된 시도는 열리더라도 곧바로 버린다.
+  let latestAttemptId = 0;
   let hasSentReady = false;
-  // GoAway 후 재연결하는 짧은 틈에는 liveSession이 비어있거나 죽어가는 소켓을 가리킨다.
-  // transparent 재연결은 Gemini API(Vertex 전용 기능)에서 지원하지 않으므로,
-  // 그 틈에 들어온 오디오를 직접 버퍼링했다가 새 세션이 열리자마자 흘려보낸다.
-  const pendingAudio = [];
-  const MAX_PENDING_AUDIO = 1200; // 청크당 ~32ms, 약 38초 분량까지만 보관
-  // 재연결로 새 세션이 열려도 옛 세션은 자기 턴을 마저 끝내도록 살려두는데(아래
-  // connectLive 주석 참고), onmessage는 어느 세션에서 왔든 그대로 클라이언트에
-  // 전달했었다. 그래서 옛 세션이 마무리 발화를 하는 도중 새 세션이 벌써 자기
-  // 응답을 시작하면 두 세션의 오디오가 동시에 섞여 들어가 "목소리가 갈라지는"
-  // 현상이 났다(재연결이 누적되는 대화 후반부일수록 심해짐). connectLive 호출마다
-  // 세대 번호를 매기고, 더 최신 세대가 실제로 메시지를 보내기 시작하는 순간부터
-  // 그보다 오래된 세대의 메시지는 버려서 두 세션의 출력이 겹치지 않게 한다.
-  let nextSessionGeneration = 0;
-  let activeSessionGeneration = -1;
-  // GoAway 재연결과 워치독 재연결이 동시에 발생하면(둘 다 liveSession이 살아있는
-  // 상태에서 각자 connectLive를 부를 수 있다) 두 개의 연결 시도가 동시에 떠 있게
-  // 된다. 예전 코드는 .then()에서 liveSession을 무조건 덮어써서, 먼저 시작했지만
-  // 응답이 늦게 온("오래된") 세션이 나중에 시작된 세션을 밀어내고 liveSession을
-  // 차지할 수 있었다. 그러면 사용자 오디오는 죽은 세대로 계속 들어가는데 그 세대의
-  // 응답은 activeSessionGeneration보다 낮아 전부 버려지고, turnComplete도 오지
-  // 않으니 워치독이 계속 "먹통"으로 보고 재연결을 무한 반복했다 — "계속 멈추고
-  // 다시 듣고 있다는데 결국 세션이 안 끝난다"의 근본 원인이었다. 이제 "가장 최근에
-  // 시작한 연결 시도만 liveSession을 차지할 수 있다"를 명시적으로 강제한다:
-  // connectLive를 부를 때마다 latestSessionGeneration을 그 즉시(동기적으로)
-  // 갱신해두고, 나중에 그 연결이 실제로 열렸을 때 자신의 세대가 더 이상 최신이
-  // 아니면 조용히 닫아버리고 liveSession을 건드리지 않는다.
-  let latestSessionGeneration = -1;
-  // 재연결을 유발한 사유(GoAway 제외: 워치독 먹통 감지, onerror, onclose, 연결
-  // 실패)가 연속으로 몇 번 있었는지 센다. 실제로 Gemini로부터 내용 있는 메시지를
-  // 한 번이라도 받으면(정상적으로 대화가 오가고 있다는 뜻) 0으로 리셋된다. 예전
-  // 코드는 onerror/onclose가 나면 재시도 없이 곧바로 클라이언트에 에러를 보내
-  // 전체 코칭 세션을 끝내버렸다 — 흔한 일시적 연결 끊김 한 번에도 마무리 단계에
-  // 이르기 전에 세션이 죽어버리는 게 "결국 세션이 끝나질 못한다"의 또 다른 직접
-  // 원인이었다. 이제 모든 재연결 트리거를 이 카운터 하나로 묶어서, 계속 실패해도
-  // 최소 몇 번은 자동으로 다시 시도해 세션을 살리려 하고, 그래도 안 되면 그때는
-  // 명확한 메시지와 함께 깔끔하게 세션을 끝낸다(무한 "재연결 중..." 상태로 방치하지 않음).
+
+  let rotating = false; // 교체용 새 세션을 여는 중(기존 세션은 계속 사용)
+  let rotateRequested = false; // GoAway 수신 시 나이와 상관없이 교체
+  let rotateNotBefore = 0;
+  let reconnectTimer = null; // 복구 재연결 대기 중
   let reconnectAttempts = 0;
-  const MAX_RECONNECT_ATTEMPTS = 5;
+  let announcedReconnecting = false;
+
+  const pendingAudio = [];
+
+  // 턴 상태
+  let modelTurnActive = false; // 모델이 말하기 시작했고 아직 turnComplete 전
+  let userTurnPendingSince = 0; // 사용자 발화를 인식했는데 아직 모델 응답이 없음
+  let lastSessionMsgAt = Date.now();
+  let lastSpeechAt = 0;
+  let speechChunksSinceMsg = 0;
+  let deafStrikes = 0;
 
   const send = (payload) => {
     if (clientWs.readyState === clientWs.OPEN) {
@@ -168,309 +237,360 @@ wss.on("connection", (clientWs) => {
     }
   };
 
-  // 가끔 goAway도, 에러도, close도 없이 세션이 응답을 완전히 멈추는 경우가 있다
-  // (오디오는 계속 보내지는데 인식/응답이 전혀 안 옴). 이런 "먹통" 상태를 감지하기
-  // 위해 Gemini로부터 마지막으로 뭔가(오디오/텍스트/턴완료 등 무엇이든)를 받은
-  // 시각을 기록해두고, 너무 오래 아무 신호가 없으면 세션이 죽었다고 보고 스스로
-  // 새 세션으로 갈아탄다.
-  //
-  // 단, 재연결은 세션 리줌 체크포인트 이후의 최근 대화가 유실될 위험을 안고 있으므로
-  // (Gemini Live API 공식 문서에도 명시된 한계) 꼭 필요할 때만 해야 한다. 그런데
-  // 이 코치는 시스템 프롬프트에서부터 "고객이 스스로 채울 여백을 남긴다"며 질문 뒤에
-  // 긴 침묵을 의도적으로 유도한다 — 즉 사용자가 10초 넘게 생각하며 조용히 있는 건
-  // 코칭 세션에서 지극히 정상이다. 그런데 아래 워치독은 "Gemini가 마지막으로 뭔가
-  // 보낸 시점"부터만 재는데, AI가 질문을 던지고 turnComplete를 보낸 직후부터도 이
-  // 타이머가 흐르기 시작한다. 그래서 사용자가 그 여백 동안 정상적으로 침묵하면
-  // "먹통"으로 오판해 불필요하게 재연결시키고, 그때마다 최근 대화가 유실될 위험을
-  // 감수하게 된다 — 대화가 길어질수록 그런 침묵 구간을 만날 확률이 누적되니 "뒤로
-  // 갈수록 못 알아듣는다"는 증상으로 나타난 근본 원인이었다.
-  //
-  // 그래서 "지금 Gemini의 응답을 실제로 기다리고 있는 상태"일 때만 감시한다:
-  // 사용자가 말하기 시작하면 감시를 켜고, Gemini가 그 턴을 완결(turnComplete)하면
-  // 다시 끈다. AI가 다음 말을 걸 차례가 아니라 사용자 차례일 때는 아무리 조용해도
-  // 절대 재연결하지 않는다.
-  //
-  // 감시 중일 때의 임계값은 두 가지로 나눈다:
-  // - 사용자가 "지금 실제로 말하고 있는데" 응답이 없으면 명백히 비정상이므로
-  //   짧게(FAST) 기다리고 바로 재연결한다.
-  // - 사용자가 말을 막 끝내고 Gemini의 응답 생성을 기다리는 중이면 약간 더 길게
-  //   (SLOW) 기다린 뒤에만 재연결한다.
-  let lastGeminiMessageAt = Date.now();
-  let lastSpeechAt = 0;
-  let awaitingReply = false;
-  const WATCHDOG_CHECK_MS = 1000;
-  const RECENT_SPEECH_WINDOW_MS = 2000;
-  const FAST_STALL_MS = 6000;
-  const SLOW_STALL_MS = 14000;
-  const watchdogTimer = setInterval(() => {
-    if (closedByClient || !awaitingReply) return;
-    const now = Date.now();
-    const silentFor = now - lastGeminiMessageAt;
-    const userCurrentlySpeaking = now - lastSpeechAt < RECENT_SPEECH_WINDOW_MS;
-    const stallThreshold = userCurrentlySpeaking ? FAST_STALL_MS : SLOW_STALL_MS;
-
-    if (silentFor > stallThreshold && liveSession) {
-      console.warn(
-        `[Gemini] ${Math.round(silentFor / 1000)}초간 아무 응답이 없어(사용자 발화 중: ${userCurrentlySpeaking}) 세션이 멈춘 것으로 보고 재연결합니다.`
-      );
-      lastGeminiMessageAt = Date.now(); // 재연결 도중 워치독이 중복 발동하지 않도록
-      scheduleReconnect("워치독: 응답 없음");
-    }
-  }, WATCHDOG_CHECK_MS);
-
-  // GoAway를 제외한 모든 재연결 트리거(워치독 먹통 감지 / onerror / onclose /
-  // 연결 자체 실패)가 이 함수 하나를 거친다. 실패가 쌓여도 MAX_RECONNECT_ATTEMPTS
-  // 번까지는 점점 늘어나는 대기시간을 두고 자동으로 다시 시도해서, 흔한 일시적
-  // 끊김 한 번에 전체 코칭 세션이 죽어버리지 않게 한다. 그래도 계속 실패하면
-  // "재연결 중..." 상태로 무한정 방치하지 않고, 그때는 명확한 메시지와 함께
-  // 세션을 깔끔하게 끝낸다.
-  function scheduleReconnect(reason) {
-    if (closedByClient) return;
-    reconnectAttempts++;
-    console.warn(`[Gemini] 재연결 필요 (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}, 사유: ${reason})`);
-
-    if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-      console.error("[Gemini] 재연결이 계속 실패해 세션을 종료합니다.");
-      send({ type: "error", message: "AI 연결이 계속 불안정해서 세션을 이어갈 수 없어요. 다시 시작해주세요." });
-      clientWs.close();
-      return;
-    }
-
-    // 재시도 절반 지점까지 계속 실패한다면 세션 재개(resumption) 핸들 자체가
-    // 문제일 가능성이 있으니, 그 다음부터는 깨끗한 새 세션으로 전환해본다.
-    if (reconnectAttempts === Math.ceil(MAX_RECONNECT_ATTEMPTS / 2) && resumptionHandle) {
-      console.warn("[Gemini] 세션 재개 핸들을 초기화하고 새 세션으로 재연결합니다.");
-      resumptionHandle = null;
-    }
-
-    // 더 이상 신뢰할 수 없는 세션은 바로 비워서, 그동안 들어오는 오디오는
-    // pendingAudio에 쌓였다가 새 세션이 열리면 이어서 전달되게 한다.
-    liveSession = null;
-    send({ type: "reconnecting" });
-    const delayMs = Math.min(400 * reconnectAttempts, 4000);
-    setTimeout(() => connectLive(true), delayMs);
+  function appendTranscript(role, text) {
+    if (!text) return;
+    const last = transcript[transcript.length - 1];
+    if (last && last.role === role) last.text += text;
+    else transcript.push({ role, text });
   }
 
-  function connectLive(announce = false) {
-    // 이 connectLive 호출로 만들어진 세션 객체를 직접 들고 있는다.
-    // liveSession(바깥 변수)은 재연결 과정에서 다른 세션으로 바뀔 수 있으므로,
-    // onclose에서 "내가 여전히 현재 세션인지"를 판단하려면 이 참조가 필요하다.
-    let thisSession = null;
-    const myGeneration = nextSessionGeneration++;
-    // 이 호출이 지금 이 순간 "가장 최근에 시작된" 연결 시도임을 동기적으로 표시한다.
-    // 나중에 이 세션이 실제로 열렸을 때(.then) 자신의 세대가 더 이상 최신이 아니면
-    // (그 사이 더 최근 연결 시도가 시작됐다면) liveSession을 차지하지 않고 조용히
-    // 닫는다 — 어느 쪽 Promise가 먼저 끝나든 상관없이 항상 "가장 나중에 시작한
-    // 시도"만 승리하게 되어 위의 경쟁 상태 버그를 근본적으로 막는다.
-    latestSessionGeneration = myGeneration;
-    const isSuperseded = () => myGeneration !== latestSessionGeneration;
+  function onModelOutput() {
+    modelTurnActive = true;
+    userTurnPendingSince = 0;
+    // 모델이 실제로 말을 하고 있다 = 세션이 건강하다. 이때만 실패 카운트를 리셋한다.
+    reconnectAttempts = 0;
+    deafStrikes = 0;
+  }
+
+  function closeQuietly(session) {
+    try {
+      session?.close();
+    } catch {
+      // 이미 닫힌 세션
+    }
+  }
+
+  // kind: "initial" | "rotate" | "recover"
+  function openSession(kind) {
+    const id = nextSessionId++;
+    latestAttemptId = id;
+    const isStale = () => id !== latestAttemptId || closedByClient;
+
+    // 복구 시, 마지막 발화가 아직 답을 못 받은 사용자 말이라면 기록에서 빼두었다가
+    // 새 세션이 열리자마자 사용자 턴으로 보내 곧바로 답하게 한다(다시 말할 필요 없음).
+    let entries = transcript;
+    let unansweredUserText = null;
+    const last = transcript[transcript.length - 1];
+    if (kind === "recover" && last?.role === "user" && userTurnPendingSince) {
+      entries = transcript.slice(0, -1);
+      unansweredUserText = last.text.trim();
+    }
+
+    let session = null;
+    let setupDone = false;
+    let installed = false;
+    const connectTimer = setTimeout(() => {
+      if (installed || isStale()) return;
+      console.warn(`[Gemini] 세션 #${id} 준비 시간 초과 (${kind})`);
+      fail("연결 시간 초과");
+    }, CONNECT_TIMEOUT_MS);
+
+    function fail(reason) {
+      clearTimeout(connectTimer);
+      closeQuietly(session);
+      if (isStale()) return;
+      if (kind === "rotate") {
+        // 교체 실패는 치명적이지 않다: 기존 세션을 그대로 쓰고 잠시 뒤 다시 시도.
+        console.warn(`[Gemini] 세션 교체 실패, 기존 세션 유지: ${reason}`);
+        latestAttemptId = currentSessionId;
+        rotating = false;
+        rotateNotBefore = Date.now() + ROTATE_RETRY_MS;
+        return;
+      }
+      scheduleReconnect(`연결 실패: ${reason}`);
+    }
+
+    function tryInstall() {
+      if (installed || !session || !setupDone) return;
+      if (isStale()) {
+        closeQuietly(session);
+        return;
+      }
+      installed = true;
+      clearTimeout(connectTimer);
+
+      const old = liveSession;
+      liveSession = session;
+      currentSessionId = id;
+      sessionStartedAt = Date.now();
+      lastSessionMsgAt = Date.now();
+      speechChunksSinceMsg = 0;
+      modelTurnActive = false;
+      rotating = false;
+      rotateRequested = false;
+      if (old && old !== session) closeQuietly(old);
+      console.log(`[Gemini] 세션 #${id} 사용 시작 (${kind}, 대화 기록 ${transcript.length}항목 인계)`);
+
+      if (unansweredUserText) {
+        try {
+          session.sendClientContent({
+            turns: [{ role: "user", parts: [{ text: unansweredUserText }] }],
+            turnComplete: true,
+          });
+        } catch (err) {
+          console.error("[Gemini] 미응답 발화 재전송 실패:", err?.message || err);
+        }
+      }
+      if (pendingAudio.length > 0) {
+        console.log(`[Gemini] 대기 중 쌓인 오디오 ${pendingAudio.length}청크 전달`);
+        for (const payload of pendingAudio) {
+          try {
+            session.sendRealtimeInput(payload);
+          } catch (err) {
+            console.error("[Gemini] 대기 오디오 전달 실패:", err?.message || err);
+            break;
+          }
+        }
+        pendingAudio.length = 0;
+      }
+
+      if (!hasSentReady) {
+        hasSentReady = true;
+        send({ type: "ready" });
+      } else if (announcedReconnecting) {
+        announcedReconnecting = false;
+        send({ type: "reconnected" });
+      }
+    }
 
     ai.live
       .connect({
         model: LIVE_MODEL,
-        config: buildLiveConfig(resumptionHandle),
+        config: buildLiveConfig(buildSystemInstruction(entries, wrapUpCalled)),
         callbacks: {
-          onopen: () => {
-            if (isSuperseded()) return;
-            if (!hasSentReady) {
-              hasSentReady = true;
-              send({ type: "ready" });
-            } else {
-              console.log("[Gemini] 세션 재연결 완료");
-              if (announce) send({ type: "reconnected" });
-            }
-          },
           onmessage: (message) => {
-            if (message.sessionResumptionUpdate?.resumable && message.sessionResumptionUpdate.newHandle) {
-              resumptionHandle = message.sessionResumptionUpdate.newHandle;
-            }
-            if (message.goAway) {
-              console.log("[Gemini] GoAway 수신 (남은 시간:", message.goAway.timeLeft, ") — 백그라운드로 재연결 시도");
-              lastGeminiMessageAt = Date.now();
-              // GoAway는 "지금 끊겨라"가 아니라 "timeLeft 뒤에 끊길 예정"이라는 예고다.
-              // 이 세션은 그때까지 계속 정상 작동하므로 liveSession을 여기서 비우지
-              // 않는다 — 비우면 새 세션이 열릴 때까지 매번 음성이 통째로 멈춰서
-              // 체감 지연이 커진다. 새 세션은 백그라운드로 미리 연결해두고, 완전히
-              // 준비된 순간(.then 콜백)에만 liveSession을 갈아타서 끊김 없이 전환한다.
-              // 혹시라도 새 세션이 열리기 전에 이 세션이 실제로 죽으면(onclose/onerror),
-              // 그때 비로소 liveSession이 비워지고 pendingAudio가 안전망 역할을 한다.
-              // GoAway로 인한 재연결은 정상적인 예고된 유지보수이지 실패가 아니므로
-              // scheduleReconnect(재시도 횟수 소모)를 거치지 않고 직접 시도한다.
-              connectLive(false);
+            if (message.setupComplete) {
+              setupDone = true;
+              tryInstall();
               return;
             }
-            // 더 최신 세대가 이미 응답을 시작했다면, 뒤늦게 도착한 옛 세대의 메시지는
-            // 버린다 — 그대로 흘려보내면 두 세션의 오디오가 겹쳐 들린다. 승격은 실제
-            // 오디오/텍스트 등 내용이 있는 메시지에서만 일어나게 해서, 내용 없는
-            // 부수 메시지(세션 재개 핸들 갱신 등) 때문에 옛 세션이 말을 채 끝내기도
-            // 전에 조기 차단되는 일이 없게 한다. 이 판정보다 앞서 lastGeminiMessageAt을
-            // 갱신하지 않는 이유: 이미 버려진 옛 세대가 뒤늦게 흘려보내는 메시지 때문에
-            // 워치독 타이머가 리셋되어, 정작 살아있는 최신 세대가 먹통이어도 감지를
-            // 못하게 되는 걸 막기 위함.
-            if (myGeneration < activeSessionGeneration) return;
-            lastGeminiMessageAt = Date.now();
-            const hasContent =
-              !!message.data ||
-              !!message.toolCall?.functionCalls?.length ||
-              !!message.serverContent?.inputTranscription?.text ||
-              !!message.serverContent?.outputTranscription?.text ||
-              !!message.serverContent?.interrupted ||
-              !!message.serverContent?.turnComplete;
-            if (hasContent) {
-              activeSessionGeneration = myGeneration;
-              // 실제로 대화 내용이 오가고 있다는 확실한 증거이므로, 그동안 쌓였던
-              // 실패 카운트를 리셋한다. 재연결 자체는 "성공"해도 그 뒤로 Gemini가
-              // 계속 아무 내용도 안 보내면 카운트를 리셋하지 않아, 결국
-              // MAX_RECONNECT_ATTEMPTS에 도달해 세션이 무한 "재연결 중..." 상태로
-              // 방치되지 않고 명확하게 종료되도록 한다.
-              reconnectAttempts = 0;
-            }
-            // Gemini가 이번 턴을 완결하면 다시 사용자 차례이므로, 사용자가 다음에
-            // 말을 시작하기 전까지는(아래 clientWs.on("message")) 워치독을 끈다.
-            if (message.serverContent?.turnComplete) awaitingReply = false;
-
-            // 함수 호출 응답은 반드시 그 호출을 만든 세션(thisSession) 자신에게 돌려줘야
-            // 한다. 공유 변수 liveSession을 쓰면, 마침 이 시점에 재연결이 시작돼
-            // liveSession이 비워지거나 다른 세션으로 바뀐 경우 응답이 유실되고,
-            // Gemini는 그 함수 호출의 응답을 기다리며 멈춰버린다(마무리 단계에서 자주
-            // 발생하던 "그 뒤로 안 들리는" 증상의 원인).
-            handleGeminiMessage(message, send, (functionResponses) =>
-              thisSession?.sendToolResponse({ functionResponses })
-            );
+            if (id !== currentSessionId) return;
+            handleSessionMessage(message, session);
           },
           onerror: (err) => {
-            console.error("Gemini Live 오류:", err?.message || err);
-            if (liveSession === thisSession) liveSession = null;
-            // 이미 더 최신 연결 시도로 대체된 세션의 뒤늦은 오류는 무시한다(그 최신
-            // 시도가 알아서 자기 생애주기를 관리한다). 그렇지 않다면(지금 이 세션이
-            // 여전히 "현재" 세션이었다면) 예전처럼 곧바로 전체 세션을 죽이는 대신
-            // 자동 재연결을 시도한다 — 일시적 오류 한 번에 코칭 세션 전체가
-            // 끝나버리지 않도록.
-            if (isSuperseded()) return;
-            scheduleReconnect(`onerror: ${err?.message || err}`);
+            console.error(`[Gemini] 세션 #${id} 오류:`, err?.message || err);
+            if (id === currentSessionId) scheduleReconnect(`onerror: ${err?.message || err}`);
+            else if (!installed) fail(`onerror: ${err?.message || err}`);
           },
           onclose: (event) => {
-            console.error("Gemini Live 종료:", event?.code, event?.reason);
-            // 새 세션으로 이미 넘어갔다면 옛 세션이 뒤늦게 닫혀도 liveSession을 건드리지 않는다.
-            if (liveSession === thisSession) liveSession = null;
-            if (closedByClient || isSuperseded()) return;
-            scheduleReconnect(`onclose: ${event?.code} ${event?.reason}`);
+            console.log(`[Gemini] 세션 #${id} 종료:`, event?.code, event?.reason);
+            if (closedByClient) return;
+            if (id === currentSessionId) scheduleReconnect(`onclose: ${event?.code} ${event?.reason}`);
+            else if (!installed) fail(`onclose: ${event?.code} ${event?.reason}`);
           },
         },
       })
-      .then((session) => {
-        // 연결이 완료되기 전에 클라이언트가 이미 나갔다면 곧바로 정리한다
-        // (재연결 도중 사용자가 통화를 끊는 경우, 세션이 안 닫힌 채 남는 걸 방지).
-        // 마찬가지로, 이 세션이 열리는 동안 더 최신 연결 시도가 이미 시작됐다면
-        // (워치독/GoAway가 겹쳐 발동한 경우) 이 세션은 liveSession을 차지하지 않고
-        // 곧바로 닫는다 — 항상 가장 최근에 시작한 시도만 살아남게 한다.
-        if (closedByClient || isSuperseded()) {
-          session.close();
+      .then((s) => {
+        session = s;
+        if (isStale()) {
+          clearTimeout(connectTimer);
+          closeQuietly(s);
           return;
         }
-        thisSession = session;
-        liveSession = session;
-        if (pendingAudio.length > 0) {
-          console.log(`[Gemini] 재연결 대기 중 쌓인 오디오 ${pendingAudio.length}청크 전달`);
-          for (const payload of pendingAudio) {
-            try {
-              session.sendRealtimeInput(payload);
-            } catch (err) {
-              console.error("[Gemini] 대기 오디오 전달 실패:", err?.message || err);
-            }
-          }
-          pendingAudio.length = 0;
-        }
+        tryInstall();
       })
       .catch((err) => {
-        console.error("Gemini Live 연결 실패:", err?.message || err);
-        if (closedByClient || isSuperseded()) return;
-        scheduleReconnect(`connect failed: ${err?.message || err}`);
+        console.error("[Gemini] 연결 실패:", err?.message || err);
+        fail(err?.message || String(err));
       });
   }
 
-  connectLive();
+  // 장애(끊김/오류/먹통)로 인한 복구. 여러 트리거가 동시에 와도 한 번만 예약된다.
+  function scheduleReconnect(reason) {
+    if (closedByClient || reconnectTimer) return;
+    reconnectAttempts++;
+    console.warn(`[Gemini] 복구 재연결 (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}, 사유: ${reason})`);
 
-  clientWs.on("message", (raw) => {
-    let msg;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch {
+    const dead = liveSession;
+    liveSession = null;
+    currentSessionId = 0;
+    latestAttemptId = -1; // 진행 중이던 교체 시도가 있었다면 무효화(복구 시도가 대신한다)
+    rotating = false;
+    modelTurnActive = false;
+    closeQuietly(dead);
+
+    if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+      console.error("[Gemini] 복구가 계속 실패해 세션을 종료합니다.");
+      send({ type: "error", message: "AI 연결이 계속 불안정해서 세션을 이어갈 수 없어요. 잠시 후 다시 시작해주세요." });
+      clientWs.close();
       return;
     }
 
-    if (msg.type === "audio") {
-      if (msg.speaking) {
-        lastSpeechAt = Date.now();
-        // 사용자가 말을 시작했으니 이제부터 Gemini의 응답을 기다리는 구간이다.
-        // 워치독은 이 시점부터 다음 turnComplete까지만 감시한다.
-        awaitingReply = true;
+    const delayMs = reconnectAttempts === 1 ? 0 : Math.min(500 * (reconnectAttempts - 1), 4000);
+    const startedAt = Date.now();
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      openSession("recover");
+    }, delayMs);
+    // 짧게 끝나는 복구는 사용자가 눈치채지 못하게, 오래 걸릴 때만 안내한다.
+    setTimeout(() => {
+      if (!closedByClient && !liveSession && Date.now() - startedAt >= ANNOUNCE_RECONNECT_AFTER_MS) {
+        announcedReconnecting = true;
+        send({ type: "reconnecting" });
       }
-      const rate = msg.sampleRate || 16000;
-      const payload = { audio: { data: msg.data, mimeType: `audio/pcm;rate=${rate}` } };
-      if (liveSession) {
-        try {
-          liveSession.sendRealtimeInput(payload);
-        } catch (err) {
-          console.error("[Gemini] 오디오 전송 실패, 재연결 대기열에 보관:", err?.message || err);
-          pendingAudio.push(payload);
-          // onerror/onclose가 뒤따라 오지 않을 수도 있으니(예: 이미 죽은 소켓에
-          // 조용히 쓰기 실패), 여기서도 직접 재연결을 걸어 먹통 상태로 방치되지 않게 한다.
-          scheduleReconnect(`sendRealtimeInput 실패: ${err?.message || err}`);
+    }, ANNOUNCE_RECONNECT_AFTER_MS);
+  }
+
+  function handleSessionMessage(message, session) {
+    lastSessionMsgAt = Date.now();
+    speechChunksSinceMsg = 0;
+
+    if (message.goAway) {
+      console.log("[Gemini] GoAway 수신 (남은 시간:", message.goAway.timeLeft, ") — 다음 조용한 순간에 세션 교체");
+      rotateRequested = true;
+    }
+
+    if (message.toolCall?.functionCalls?.length) {
+      const functionResponses = [];
+      for (const call of message.toolCall.functionCalls) {
+        if (call.name === "mark_coaching_wrap_up") {
+          console.log("[Gemini] 코칭 마무리 단계 진입 신호 수신");
+          wrapUpCalled = true;
+          send({ type: "showFinishButton" });
         }
-      } else {
-        // 재연결 중 (GoAway~새 세션 open 사이). 새 세션이 열리면 순서대로 전달된다.
+        functionResponses.push({ id: call.id, name: call.name, response: { output: "ok" } });
+      }
+      // 응답은 반드시 그 호출을 만든 세션에 돌려준다(안 그러면 모델이 응답을 기다리며 멈춤).
+      try {
+        session?.sendToolResponse({ functionResponses });
+      } catch (err) {
+        console.error("[Gemini] 함수 응답 전송 실패:", err?.message || err);
+      }
+    }
+
+    // message.data 게터는 모델의 thought 파트가 섞여 있으면 청크마다 경고 로그를 찍으므로
+    // (무료 인스턴스에선 무시 못 할 부하) 오디오 파트를 직접 꺼낸다.
+    const sc = message.serverContent;
+    for (const part of sc?.modelTurn?.parts ?? []) {
+      if (part.inlineData?.data && part.inlineData.mimeType?.startsWith("audio/")) {
+        onModelOutput();
+        send({ type: "audio", data: part.inlineData.data });
+      }
+    }
+
+    if (sc?.inputTranscription?.text) {
+      console.log(`[Gemini] 사용자 발화 인식: ${sc.inputTranscription.text}`);
+      appendTranscript("user", sc.inputTranscription.text);
+      userTurnPendingSince = Date.now();
+      send({ type: "userText", text: sc.inputTranscription.text });
+    }
+    if (sc?.outputTranscription?.text) {
+      onModelOutput();
+      appendTranscript("model", sc.outputTranscription.text);
+      send({ type: "modelText", text: sc.outputTranscription.text });
+    }
+    if (sc?.interrupted) {
+      modelTurnActive = false;
+      send({ type: "interrupted" });
+    }
+    if (sc?.turnComplete) {
+      console.log("[Gemini] 턴 완료");
+      modelTurnActive = false;
+      send({ type: "turnComplete" });
+    }
+  }
+
+  const watchdogTimer = setInterval(() => {
+    if (closedByClient || !liveSession || reconnectTimer) return;
+    const now = Date.now();
+    const silentFor = now - lastSessionMsgAt;
+
+    // 모델이 말하다가 turnComplete 없이 조용해진 경우, 턴이 끝난 것으로 본다
+    // (안 그러면 교체와 워치독 A가 영영 막힌다).
+    if (modelTurnActive && silentFor > 20_000) modelTurnActive = false;
+
+    // A) 사용자 말은 알아들었는데 답이 안 옴 → 복구(미응답 발화는 새 세션에 넘겨 바로 답하게 함)
+    if (userTurnPendingSince && !modelTurnActive && silentFor > REPLY_STALL_MS) {
+      console.warn(`[Gemini] 사용자 발화 인식 후 ${Math.round(silentFor / 1000)}초간 응답 없음`);
+      scheduleReconnect("워치독: 응답 없음");
+      return;
+    }
+
+    // B) 사용자가 한참 말하는데 세션이 아무 반응도 없음(귀가 먹은 세션).
+    // 주변 소음 오탐으로 무한 재연결되지 않도록, 모델이 다시 말하기 전까지 최대 2번만.
+    if (deafStrikes < 2 && speechChunksSinceMsg >= DEAF_MIN_SPEECH_CHUNKS && silentFor > DEAF_STALL_MS) {
+      deafStrikes++;
+      console.warn(`[Gemini] 사용자 발화 중 ${Math.round(silentFor / 1000)}초간 세션 무반응`);
+      scheduleReconnect("워치독: 무반응");
+      return;
+    }
+
+    // 세션 교체: 오래된 세션(또는 GoAway 받은 세션)을 사용자 차례의 조용한 순간에 교체.
+    const due = rotateRequested || now - sessionStartedAt > ROTATE_AFTER_MS;
+    const quiet = !modelTurnActive && !userTurnPendingSince && now - lastSpeechAt > QUIET_BEFORE_ROTATE_MS;
+    if (due && quiet && !rotating && now >= rotateNotBefore) {
+      console.log(`[Gemini] 세션 #${currentSessionId} 교체 시작 (사용 ${Math.round((now - sessionStartedAt) / 1000)}초)`);
+      rotating = true;
+      openSession("rotate");
+    }
+  }, WATCHDOG_CHECK_MS);
+
+  function abortRotation() {
+    if (!rotating) return;
+    console.log("[Gemini] 사용자가 말을 시작해 세션 교체를 미룹니다.");
+    rotating = false;
+    latestAttemptId = currentSessionId; // 열리는 중인 새 세션은 stale 처리되어 버려진다
+    rotateNotBefore = 0;
+  }
+
+  openSession("initial");
+
+  clientWs.on("message", (raw, isBinary) => {
+    if (!isBinary) {
+      let msg;
+      try {
+        msg = JSON.parse(raw.toString());
+      } catch {
+        return;
+      }
+      if (msg.type === "mic" && Number(msg.sampleRate) > 0) {
+        inputSampleRate = Number(msg.sampleRate);
+      }
+      return;
+    }
+
+    // 바이너리 오디오 프레임: [1바이트 발화 플래그][16비트 PCM]
+    if (raw.length < 3) return;
+    const speaking = raw[0] === 1;
+    const payload = {
+      audio: { data: raw.subarray(1).toString("base64"), mimeType: `audio/pcm;rate=${inputSampleRate}` },
+    };
+
+    if (speaking) {
+      lastSpeechAt = Date.now();
+      speechChunksSinceMsg++;
+      // 교체 준비 중에 사용자가 말을 시작하면, 말이 두 세션으로 쪼개지지 않게 교체를 미룬다.
+      abortRotation();
+    }
+
+    if (liveSession) {
+      try {
+        liveSession.sendRealtimeInput(payload);
+      } catch (err) {
         pendingAudio.push(payload);
-        if (pendingAudio.length > MAX_PENDING_AUDIO) pendingAudio.shift();
+        scheduleReconnect(`오디오 전송 실패: ${err?.message || err}`);
       }
-      receivedChunks++;
-      if (receivedChunks % 80 === 0) {
-        console.log(`[클라이언트] 오디오 ${receivedChunks}청크 전달 (rate=${rate})`);
-      }
+    } else {
+      pendingAudio.push(payload);
+      if (pendingAudio.length > MAX_PENDING_AUDIO) pendingAudio.shift();
+    }
+
+    receivedChunks++;
+    if (receivedChunks % 300 === 0) {
+      console.log(`[클라이언트] 오디오 ${receivedChunks}청크 수신 (rate=${inputSampleRate})`);
     }
   });
 
   clientWs.on("close", () => {
+    console.log("[클라이언트] 연결 종료");
     closedByClient = true;
     clearInterval(watchdogTimer);
-    liveSession?.close();
+    clearTimeout(reconnectTimer);
+    closeQuietly(liveSession);
+    liveSession = null;
   });
 });
 
-function handleGeminiMessage(message, send, sendToolResponse) {
-  if (message.toolCall?.functionCalls?.length) {
-    const responses = [];
-    for (const call of message.toolCall.functionCalls) {
-      if (call.name === "mark_coaching_wrap_up") {
-        console.log("[Gemini] 코칭 마무리 단계 진입 신호 수신");
-        send({ type: "showFinishButton" });
-      }
-      responses.push({ id: call.id, name: call.name, response: { output: "ok" } });
-    }
-    sendToolResponse(responses);
-  }
-
-  if (message.data) {
-    send({ type: "audio", data: message.data });
-  }
-
-  const sc = message.serverContent;
-  if (sc?.inputTranscription?.text) {
-    console.log(`[Gemini] 사용자 발화 인식: ${sc.inputTranscription.text}`);
-    send({ type: "userText", text: sc.inputTranscription.text });
-  }
-  if (sc?.outputTranscription?.text) {
-    console.log(`[Gemini] 응답 텍스트: ${sc.outputTranscription.text}`);
-    send({ type: "modelText", text: sc.outputTranscription.text });
-  }
-  if (sc?.interrupted) {
-    send({ type: "interrupted" });
-  }
-  if (sc?.turnComplete) {
-    console.log("[Gemini] 턴 완료");
-    send({ type: "turnComplete" });
-  }
-}
 
 server.listen(PORT, () => {
   console.log(`멘코 서버가 http://localhost:${PORT} 에서 실행 중입니다.`);
