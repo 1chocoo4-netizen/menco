@@ -46,6 +46,30 @@ let micStream = null;
 let remoteAudio = null;
 let levelContext = null;
 let levelFrame = null;
+let pacingTimer = null;
+
+// 음성 AI는 시간이 얼마나 흘렀는지 스스로 알 수 없어서, 코칭을 몇 번 주고받다 서둘러 끝내버리곤
+// 한다. 5분마다 경과 시간을 (말하지 않는) 시스템 메모로 알려줘서 20~30분 세션의 속도를 조절하게 한다.
+const PACING_INTERVAL_MIN = 5;
+
+function startPacingNotes() {
+  let elapsedMin = 0;
+  pacingTimer = setInterval(() => {
+    elapsedMin += PACING_INTERVAL_MIN;
+    let hint;
+    if (elapsedMin < 15) hint = "아직 세션 초중반이다. 서두르지 말고 현재 단계에서 충분히 깊이 탐색한다.";
+    else if (elapsedMin < 25) hint = "세션 중후반이다. 대안 탐색과 실행 계획으로 자연스럽게 나아간다.";
+    else hint = "세션 후반이다. 실행 의지를 확인하고 마무리 단계로 이끈다.";
+    sendEvent({
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: "system",
+        content: [{ type: "input_text", text: `[진행 시간 안내 — 고객에게 말하지 말 것] 코칭 시작 후 약 ${elapsedMin}분 경과. ${hint}` }],
+      },
+    });
+  }, PACING_INTERVAL_MIN * 60 * 1000);
+}
 
 function setState(state, message) {
   bodyEl.classList.remove("connecting", "listening", "speaking");
@@ -179,11 +203,14 @@ async function startSession() {
   await pc.setRemoteDescription({ type: "answer", sdp: await sdpRes.text() });
 
   startMicLevelMeter(micStream);
+  startPacingNotes();
   setState("listening", "듣고 있어요...");
 }
 
 function endSession(message = "버튼을 누르고 멘탈 코칭 대화를 시작해 보세요") {
   sessionActive = false;
+  clearInterval(pacingTimer);
+  pacingTimer = null;
   if (levelFrame) cancelAnimationFrame(levelFrame);
   levelFrame = null;
   updateMicLevel(0);
