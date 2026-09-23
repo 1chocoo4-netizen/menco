@@ -1,17 +1,7 @@
-// 마이크 RMS가 이 값을 넘으면 "말하는 중"으로 간주한다 (배경 잡음보다는 확실히 크게).
-const SPEECH_RMS_THRESHOLD = 0.02;
-// AI 목소리가 스피커로 나오는 동안에는 그 소리가 마이크로 다시 들어가(에코) Gemini가
-// 자기 목소리를 사용자 말로 착각한다 — 스스로 말을 끊어 목소리가 뚝뚝 갈라지고, 자기
-// 말에 대답하느라 대화가 점점 이상해진다(구글도 헤드폰 사용을 권장하는 알려진 문제).
-// 그래서 AI 음성 재생 중에는 마이크 대신 무음을 보내고, 사용자가 이 크기 이상으로
-// BARGE_IN_CHUNKS만큼(약 0.25초) 계속 말할 때만 끼어들기로 인정해 마이크를 연다.
-const BARGE_IN_RMS_THRESHOLD = 0.07;
-const BARGE_IN_CHUNKS = 8;
-// 재생이 끝난 뒤에도 스피커 잔향이 잠깐 남으므로 이만큼 더 무음 처리한다.
-const ECHO_TAIL_SEC = 0.3;
-// 네트워크로 오는 음성 조각 사이가 조금만 벌어져도 "틱틱" 끊기지 않도록, 새로 재생을
-// 시작할 때 이만큼 여유를 두고 시작한다.
-const PLAYBACK_JITTER_SEC = 0.08;
+// 음성은 브라우저 ↔ OpenAI Realtime이 WebRTC로 직접 주고받는다. 서버(/session)는
+// 짧게 유효한 인증 토큰만 발급한다. WebRTC 통화 음성에는 브라우저의 에코 제거가
+// 제대로 적용되어, AI가 스피커로 나온 자기 목소리를 사용자 말로 착각하지 않는다.
+const REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls";
 
 const micButton = document.getElementById("micButton");
 const statusEl = document.getElementById("status");
@@ -49,18 +39,13 @@ consentAgreeButton.addEventListener("click", () => {
   consentModal.hidden = true;
 });
 
-let ws = null;
 let sessionActive = false;
-
-let inputAudioContext = null;
-let inputSourceNode = null;
-let processorNode = null;
+let pc = null;
+let dc = null;
 let micStream = null;
-
-let outputAudioContext = null;
-let nextStartTime = 0;
-const activeSources = new Set();
-let turnComplete = true;
+let remoteAudio = null;
+let levelContext = null;
+let levelFrame = null;
 
 function setState(state, message) {
   bodyEl.classList.remove("connecting", "listening", "speaking");
@@ -73,245 +58,170 @@ function updateMicLevel(rms) {
   micButton.style.setProperty("--mic-level", level.toFixed(3));
 }
 
-function base64ToInt16(base64) {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return new Int16Array(bytes.buffer);
-}
-
-function floatTo16BitPCM(float32Array) {
-  const int16 = new Int16Array(float32Array.length);
-  for (let i = 0; i < float32Array.length; i++) {
-    const s = Math.max(-1, Math.min(1, float32Array[i]));
-    int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-  }
-  return int16;
-}
-
-function playAudioChunk(base64Data) {
-  if (outputAudioContext.state === "suspended") outputAudioContext.resume();
-
-  const int16 = base64ToInt16(base64Data);
-  const float32 = new Float32Array(int16.length);
-  for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 0x8000;
-
-  const buffer = outputAudioContext.createBuffer(1, float32.length, 24000);
-  buffer.copyToChannel(float32, 0);
-
-  const source = outputAudioContext.createBufferSource();
-  source.buffer = buffer;
-  source.connect(outputAudioContext.destination);
-
-  const now = outputAudioContext.currentTime;
-  const startTime = nextStartTime > now ? nextStartTime : now + PLAYBACK_JITTER_SEC;
-  source.start(startTime);
-  nextStartTime = startTime + buffer.duration;
-
-  activeSources.add(source);
-  setState("speaking");
-
-  source.onended = () => {
-    activeSources.delete(source);
-    if (activeSources.size === 0 && turnComplete && sessionActive) {
-      setState("listening", "듣고 있어요...");
-    }
-  };
-}
-
-function stopPlayback() {
-  for (const source of activeSources) {
-    try {
-      source.stop();
-    } catch {
-      // 이미 종료된 소스일 수 있음
-    }
-  }
-  activeSources.clear();
-  if (outputAudioContext) nextStartTime = outputAudioContext.currentTime;
-}
-
-// AI 음성이 (잔향 포함) 아직 스피커에서 나오고 있는지.
-function isAiAudible() {
-  if (!outputAudioContext) return false;
-  return activeSources.size > 0 || nextStartTime + ECHO_TAIL_SEC > outputAudioContext.currentTime;
-}
-
-async function startMicCapture() {
-  micStream = await navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
-  });
-
-  inputAudioContext = new AudioContext({ sampleRate: 16000 });
-  if (inputAudioContext.state === "suspended") await inputAudioContext.resume();
-
-  const actualRate = inputAudioContext.sampleRate;
-  console.log(`[마이크] 입력 오디오 컨텍스트 sampleRate: ${actualRate}`);
-
-  inputSourceNode = inputAudioContext.createMediaStreamSource(micStream);
-  // Gemini Live API는 지연을 줄이려면 20~40ms 단위로 오디오를 보내라고 권장한다.
-  // 16kHz에서 512샘플 = 32ms.
-  processorNode = inputAudioContext.createScriptProcessor(512, 1, 1);
-
-  const silentGain = inputAudioContext.createGain();
-  silentGain.gain.value = 0;
-
-  ws.send(JSON.stringify({ type: "mic", sampleRate: actualRate }));
-
-  let chunkCount = 0;
-  let loudChunks = 0;
-  let bargedIn = false;
-  const recentChunks = []; // 끼어들기 인정 전까지 막아둔 최근 마이크 소리 (말 앞부분 보존)
-  processorNode.onaudioprocess = (event) => {
-    const input = event.inputBuffer.getChannelData(0);
-
+function startMicLevelMeter(stream) {
+  levelContext = new AudioContext();
+  const analyser = levelContext.createAnalyser();
+  analyser.fftSize = 1024;
+  levelContext.createMediaStreamSource(stream).connect(analyser);
+  const samples = new Float32Array(analyser.fftSize);
+  const tick = () => {
+    analyser.getFloatTimeDomainData(samples);
     let sumSquares = 0;
-    for (let i = 0; i < input.length; i++) sumSquares += input[i] * input[i];
-    const rms = Math.sqrt(sumSquares / input.length);
-    updateMicLevel(rms);
+    for (let i = 0; i < samples.length; i++) sumSquares += samples[i] * samples[i];
+    updateMicLevel(Math.sqrt(sumSquares / samples.length));
+    levelFrame = requestAnimationFrame(tick);
+  };
+  tick();
+}
 
-    if (!sessionActive || !ws || ws.readyState !== WebSocket.OPEN) return;
-    const int16 = floatTo16BitPCM(input);
+function sendEvent(event) {
+  if (dc && dc.readyState === "open") dc.send(JSON.stringify(event));
+}
 
-    // 서버로는 [1바이트 발화 플래그][16비트 PCM] 바이너리 프레임을 보낸다
-    // (JSON+base64보다 브라우저·서버 CPU를 훨씬 덜 쓴다).
-    const sendFrame = (pcm, speaking) => {
-      const frame = new Uint8Array(1 + pcm.byteLength);
-      frame[0] = speaking ? 1 : 0;
-      frame.set(new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength), 1);
-      ws.send(frame.buffer);
-    };
+// 마무리 함수 호출이 담긴 응답에 음성이 없었다면, 모델이 이어서 말하도록 응답을 요청한다.
+let wrapUpCallId = null;
 
-    if (isAiAudible() && !bargedIn) {
-      loudChunks = rms > BARGE_IN_RMS_THRESHOLD ? loudChunks + 1 : 0;
-      recentChunks.push(int16);
-      if (recentChunks.length > BARGE_IN_CHUNKS) recentChunks.shift();
-      if (loudChunks >= BARGE_IN_CHUNKS) {
-        // 사용자가 AI 말 중간에 분명히 끼어들었다: 막아뒀던 앞부분부터 그대로 보낸다.
-        bargedIn = true;
-        for (const pcm of recentChunks) sendFrame(pcm, true);
-        recentChunks.length = 0;
-      } else {
-        sendFrame(new Int16Array(int16.length), false);
+function handleServerEvent(event) {
+  switch (event.type) {
+    case "output_audio_buffer.started":
+      setState("speaking");
+      break;
+    case "output_audio_buffer.stopped":
+    case "output_audio_buffer.cleared":
+      if (sessionActive) setState("listening", "듣고 있어요...");
+      break;
+    case "response.function_call_arguments.done":
+      if (event.name === "mark_coaching_wrap_up") {
+        console.log("[멘코] 코칭 마무리 단계 진입 신호 수신");
+        finishButton.hidden = false;
       }
-    } else {
-      if (!isAiAudible()) bargedIn = false;
-      loudChunks = 0;
-      recentChunks.length = 0;
-      // 서버가 "사용자가 말하는데 AI가 반응이 없는" 진짜 먹통을 감지할 수 있도록
-      // 대략적인 발화 여부를 같이 보낸다.
-      sendFrame(int16, rms > SPEECH_RMS_THRESHOLD);
+      wrapUpCallId = event.call_id;
+      sendEvent({
+        type: "conversation.item.create",
+        item: { type: "function_call_output", call_id: event.call_id, output: JSON.stringify({ ok: true }) },
+      });
+      break;
+    case "response.done": {
+      const output = event.response?.output ?? [];
+      const hadFunctionCall = output.some((item) => item.type === "function_call" && item.call_id === wrapUpCallId);
+      const hadSpeech = output.some((item) => item.type === "message");
+      if (hadFunctionCall && !hadSpeech) sendEvent({ type: "response.create" });
+      if (hadFunctionCall) wrapUpCallId = null;
+      break;
     }
-    chunkCount++;
-    if (chunkCount % 300 === 0) console.log(`[마이크] ${chunkCount}개 청크 전송됨, RMS: ${rms.toFixed(4)}`);
+    case "error":
+      console.error("[멘코] Realtime 오류:", event.error);
+      break;
+  }
+}
+
+async function startSession() {
+  setState("connecting", "연결 중...");
+
+  const tokenRes = await fetch("/session", { method: "POST" });
+  const tokenData = await tokenRes.json().catch(() => ({}));
+  if (!tokenRes.ok || !tokenData.clientSecret) {
+    throw new Error(tokenData.error || "AI 연결을 준비하지 못했어요.");
+  }
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+  if (!sessionActive) {
+    // 마이크 권한을 기다리는 사이 사용자가 종료했다면 마이크를 바로 끈다.
+    stream.getTracks().forEach((track) => track.stop());
+    return;
+  }
+  micStream = stream;
+
+  pc = new RTCPeerConnection();
+  pc.ontrack = (event) => {
+    remoteAudio.srcObject = event.streams[0];
+  };
+  pc.onconnectionstatechange = () => {
+    if (!sessionActive || !pc) return;
+    const state = pc.connectionState;
+    if (state === "disconnected") {
+      // 잠깐의 네트워크 흔들림은 WebRTC가 스스로 복구한다.
+      setState("connecting", "연결이 잠시 불안정해요...");
+    } else if (state === "connected") {
+      setState("listening", "듣고 있어요...");
+    } else if (state === "failed") {
+      endSession("연결이 끊어졌어요. 버튼을 눌러 다시 시작해주세요.");
+    }
+  };
+  micStream.getTracks().forEach((track) => pc.addTrack(track, micStream));
+
+  dc = pc.createDataChannel("oai-events");
+  dc.onmessage = (event) => {
+    try {
+      handleServerEvent(JSON.parse(event.data));
+    } catch (err) {
+      console.error("[멘코] 이벤트 처리 실패:", err);
+    }
   };
 
-  inputSourceNode.connect(processorNode);
-  processorNode.connect(silentGain);
-  silentGain.connect(inputAudioContext.destination);
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  const sdpRes = await fetch(REALTIME_CALLS_URL, {
+    method: "POST",
+    body: offer.sdp,
+    headers: {
+      Authorization: `Bearer ${tokenData.clientSecret}`,
+      "Content-Type": "application/sdp",
+    },
+  });
+  if (!sdpRes.ok) {
+    console.error("[멘코] WebRTC 연결 실패:", sdpRes.status, await sdpRes.text());
+    throw new Error("AI와 연결하지 못했어요. 잠시 후 다시 시도해주세요.");
+  }
+  if (!sessionActive) return;
+  await pc.setRemoteDescription({ type: "answer", sdp: await sdpRes.text() });
 
+  startMicLevelMeter(micStream);
   setState("listening", "듣고 있어요...");
 }
 
-function stopMicCapture() {
-  updateMicLevel(0);
-  if (processorNode) processorNode.disconnect();
-  if (inputSourceNode) inputSourceNode.disconnect();
-  if (micStream) micStream.getTracks().forEach((track) => track.stop());
-  if (inputAudioContext) inputAudioContext.close();
-  processorNode = null;
-  inputSourceNode = null;
-  micStream = null;
-  inputAudioContext = null;
-}
-
-function connect() {
-  setState("connecting", "연결 중...");
-  const protocol = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${protocol}://${location.host}/live`);
-
-  ws.onopen = () => {
-    ws.send(JSON.stringify({ type: "start", gender: capturedGender, age: capturedAge }));
-  };
-
-  ws.onmessage = async (event) => {
-    const msg = JSON.parse(event.data);
-
-    switch (msg.type) {
-      case "ready":
-        try {
-          await startMicCapture();
-        } catch (err) {
-          console.error("마이크 접근 실패:", err);
-          setState(null, "마이크 접근이 거부됐어요.");
-          endSession();
-        }
-        break;
-      case "audio":
-        turnComplete = false;
-        playAudioChunk(msg.data);
-        break;
-      case "turnComplete":
-        turnComplete = true;
-        if (activeSources.size === 0) setState("listening", "듣고 있어요...");
-        break;
-      case "interrupted":
-        stopPlayback();
-        setState("listening", "듣고 있어요...");
-        break;
-      case "reconnecting":
-        // 서버가 백그라운드에서 AI 세션을 다시 연결하는 중. 마이크와 연결은
-        // 그대로 유지되니 계속 말씀하셔도 되고, 잠시 후 자동으로 이어집니다.
-        setState("connecting", "연결이 잠시 불안정해요. 다시 연결하고 있어요...");
-        break;
-      case "reconnected":
-        if (sessionActive) setState("listening", "다시 연결됐어요. 계속 말씀해주세요.");
-        break;
-      case "userText":
-        break;
-      case "modelText":
-        break;
-      case "showFinishButton":
-        finishButton.hidden = false;
-        break;
-      case "error":
-        console.error("서버 오류:", msg.message);
-        setState(null, msg.message);
-        endSession();
-        break;
-    }
-  };
-
-  ws.onerror = (err) => {
-    console.error("WebSocket 오류:", err);
-  };
-
-  ws.onclose = () => {
-    if (sessionActive) endSession();
-  };
-}
-
-function endSession() {
+function endSession(message = "버튼을 누르고 멘탈 코칭 대화를 시작해 보세요") {
   sessionActive = false;
-  stopMicCapture();
-  stopPlayback();
-  if (ws) {
-    ws.close();
-    ws = null;
+  if (levelFrame) cancelAnimationFrame(levelFrame);
+  levelFrame = null;
+  updateMicLevel(0);
+  if (levelContext) levelContext.close();
+  levelContext = null;
+  if (dc) dc.close();
+  dc = null;
+  if (pc) pc.close();
+  pc = null;
+  if (micStream) micStream.getTracks().forEach((track) => track.stop());
+  micStream = null;
+  if (remoteAudio) {
+    remoteAudio.srcObject = null;
+    remoteAudio.remove();
   }
+  remoteAudio = null;
+  wrapUpCallId = null;
   finishButton.hidden = true;
-  setState(null, "버튼을 누르고 멘탈 코칭 대화를 시작해 보세요");
+  setState(null, message);
 }
 
 micButton.addEventListener("click", () => {
-  if (!sessionActive) {
-    sessionActive = true;
-    if (!outputAudioContext) outputAudioContext = new AudioContext({ sampleRate: 24000 });
-    outputAudioContext.resume();
-    connect();
-  } else {
+  if (sessionActive) {
     endSession();
+    return;
   }
+  sessionActive = true;
+  // 모바일 브라우저의 자동재생 제한 때문에, 재생 요소는 사용자가 버튼을 누른 이 순간에 만든다.
+  remoteAudio = document.createElement("audio");
+  remoteAudio.autoplay = true;
+  remoteAudio.playsInline = true;
+  document.body.appendChild(remoteAudio);
+  startSession().catch((err) => {
+    if (!sessionActive) return; // 연결 중에 사용자가 이미 종료한 경우
+    console.error("[멘코] 세션 시작 실패:", err);
+    const denied = err?.name === "NotAllowedError";
+    endSession(denied ? "마이크 접근이 거부됐어요." : err?.message || "연결에 실패했어요.");
+  });
 });
 
 finishButton.addEventListener("click", () => {
