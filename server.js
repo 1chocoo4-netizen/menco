@@ -122,12 +122,12 @@ wss.on("connection", (clientWs) => {
   let closedByClient = false;
   let receivedChunks = 0;
   let resumptionHandle = null;
+  let hasSentReady = false;
   // GoAway 후 재연결하는 짧은 틈에는 liveSession이 비어있거나 죽어가는 소켓을 가리킨다.
   // transparent 재연결은 Gemini API(Vertex 전용 기능)에서 지원하지 않으므로,
   // 그 틈에 들어온 오디오를 직접 버퍼링했다가 새 세션이 열리자마자 흘려보낸다.
   const pendingAudio = [];
   const MAX_PENDING_AUDIO = 1200; // 청크당 ~32ms, 약 38초 분량까지만 보관
-  const MAX_RECONNECT_RETRIES = 3;
   // 재연결로 새 세션이 열려도 옛 세션은 자기 턴을 마저 끝내도록 살려두는데(아래
   // connectLive 주석 참고), onmessage는 어느 세션에서 왔든 그대로 클라이언트에
   // 전달했었다. 그래서 옛 세션이 마무리 발화를 하는 도중 새 세션이 벌써 자기
@@ -137,6 +137,30 @@ wss.on("connection", (clientWs) => {
   // 그보다 오래된 세대의 메시지는 버려서 두 세션의 출력이 겹치지 않게 한다.
   let nextSessionGeneration = 0;
   let activeSessionGeneration = -1;
+  // GoAway 재연결과 워치독 재연결이 동시에 발생하면(둘 다 liveSession이 살아있는
+  // 상태에서 각자 connectLive를 부를 수 있다) 두 개의 연결 시도가 동시에 떠 있게
+  // 된다. 예전 코드는 .then()에서 liveSession을 무조건 덮어써서, 먼저 시작했지만
+  // 응답이 늦게 온("오래된") 세션이 나중에 시작된 세션을 밀어내고 liveSession을
+  // 차지할 수 있었다. 그러면 사용자 오디오는 죽은 세대로 계속 들어가는데 그 세대의
+  // 응답은 activeSessionGeneration보다 낮아 전부 버려지고, turnComplete도 오지
+  // 않으니 워치독이 계속 "먹통"으로 보고 재연결을 무한 반복했다 — "계속 멈추고
+  // 다시 듣고 있다는데 결국 세션이 안 끝난다"의 근본 원인이었다. 이제 "가장 최근에
+  // 시작한 연결 시도만 liveSession을 차지할 수 있다"를 명시적으로 강제한다:
+  // connectLive를 부를 때마다 latestSessionGeneration을 그 즉시(동기적으로)
+  // 갱신해두고, 나중에 그 연결이 실제로 열렸을 때 자신의 세대가 더 이상 최신이
+  // 아니면 조용히 닫아버리고 liveSession을 건드리지 않는다.
+  let latestSessionGeneration = -1;
+  // 재연결을 유발한 사유(GoAway 제외: 워치독 먹통 감지, onerror, onclose, 연결
+  // 실패)가 연속으로 몇 번 있었는지 센다. 실제로 Gemini로부터 내용 있는 메시지를
+  // 한 번이라도 받으면(정상적으로 대화가 오가고 있다는 뜻) 0으로 리셋된다. 예전
+  // 코드는 onerror/onclose가 나면 재시도 없이 곧바로 클라이언트에 에러를 보내
+  // 전체 코칭 세션을 끝내버렸다 — 흔한 일시적 연결 끊김 한 번에도 마무리 단계에
+  // 이르기 전에 세션이 죽어버리는 게 "결국 세션이 끝나질 못한다"의 또 다른 직접
+  // 원인이었다. 이제 모든 재연결 트리거를 이 카운터 하나로 묶어서, 계속 실패해도
+  // 최소 몇 번은 자동으로 다시 시도해 세션을 살리려 하고, 그래도 안 되면 그때는
+  // 명확한 메시지와 함께 깔끔하게 세션을 끝낸다(무한 "재연결 중..." 상태로 방치하지 않음).
+  let reconnectAttempts = 0;
+  const MAX_RECONNECT_ATTEMPTS = 5;
 
   const send = (payload) => {
     if (clientWs.readyState === clientWs.OPEN) {
@@ -189,27 +213,57 @@ wss.on("connection", (clientWs) => {
       console.warn(
         `[Gemini] ${Math.round(silentFor / 1000)}초간 아무 응답이 없어(사용자 발화 중: ${userCurrentlySpeaking}) 세션이 멈춘 것으로 보고 재연결합니다.`
       );
-      // 그 정도로 오래 응답이 없었다면 이 세션은 신뢰할 수 없다. goAway 때와 달리
-      // 계속 붙잡고 있어봐야 소용없으므로 바로 비워서, 그동안 들어오는 오디오는
-      // pendingAudio에 쌓였다가 새 세션이 열리면 이어서 전달되게 한다.
-      liveSession = null;
       lastGeminiMessageAt = Date.now(); // 재연결 도중 워치독이 중복 발동하지 않도록
-      // 이 경우는 goAway와 달리 실제로 사용자가 체감할 공백이 있었으므로,
-      // 화면에 상태를 알려 당황해서 여러 번 말하지 않도록 한다.
-      send({ type: "reconnecting" });
-      connectLive(true, 0, true);
+      scheduleReconnect("워치독: 응답 없음");
     }
   }, WATCHDOG_CHECK_MS);
 
-  function connectLive(isReconnect, retryCount = 0, announce = false) {
-    // 재연결로 만들어진 세션이 나중에 (예상대로) 닫힐 때는 클라이언트에
-    // 에러를 보내지 않기 위한 플래그. goAway를 받으면 즉시 false로 바뀐다.
-    let isCurrentSession = true;
+  // GoAway를 제외한 모든 재연결 트리거(워치독 먹통 감지 / onerror / onclose /
+  // 연결 자체 실패)가 이 함수 하나를 거친다. 실패가 쌓여도 MAX_RECONNECT_ATTEMPTS
+  // 번까지는 점점 늘어나는 대기시간을 두고 자동으로 다시 시도해서, 흔한 일시적
+  // 끊김 한 번에 전체 코칭 세션이 죽어버리지 않게 한다. 그래도 계속 실패하면
+  // "재연결 중..." 상태로 무한정 방치하지 않고, 그때는 명확한 메시지와 함께
+  // 세션을 깔끔하게 끝낸다.
+  function scheduleReconnect(reason) {
+    if (closedByClient) return;
+    reconnectAttempts++;
+    console.warn(`[Gemini] 재연결 필요 (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}, 사유: ${reason})`);
+
+    if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+      console.error("[Gemini] 재연결이 계속 실패해 세션을 종료합니다.");
+      send({ type: "error", message: "AI 연결이 계속 불안정해서 세션을 이어갈 수 없어요. 다시 시작해주세요." });
+      clientWs.close();
+      return;
+    }
+
+    // 재시도 절반 지점까지 계속 실패한다면 세션 재개(resumption) 핸들 자체가
+    // 문제일 가능성이 있으니, 그 다음부터는 깨끗한 새 세션으로 전환해본다.
+    if (reconnectAttempts === Math.ceil(MAX_RECONNECT_ATTEMPTS / 2) && resumptionHandle) {
+      console.warn("[Gemini] 세션 재개 핸들을 초기화하고 새 세션으로 재연결합니다.");
+      resumptionHandle = null;
+    }
+
+    // 더 이상 신뢰할 수 없는 세션은 바로 비워서, 그동안 들어오는 오디오는
+    // pendingAudio에 쌓였다가 새 세션이 열리면 이어서 전달되게 한다.
+    liveSession = null;
+    send({ type: "reconnecting" });
+    const delayMs = Math.min(400 * reconnectAttempts, 4000);
+    setTimeout(() => connectLive(true), delayMs);
+  }
+
+  function connectLive(announce = false) {
     // 이 connectLive 호출로 만들어진 세션 객체를 직접 들고 있는다.
     // liveSession(바깥 변수)은 재연결 과정에서 다른 세션으로 바뀔 수 있으므로,
     // onclose에서 "내가 여전히 현재 세션인지"를 판단하려면 이 참조가 필요하다.
     let thisSession = null;
     const myGeneration = nextSessionGeneration++;
+    // 이 호출이 지금 이 순간 "가장 최근에 시작된" 연결 시도임을 동기적으로 표시한다.
+    // 나중에 이 세션이 실제로 열렸을 때(.then) 자신의 세대가 더 이상 최신이 아니면
+    // (그 사이 더 최근 연결 시도가 시작됐다면) liveSession을 차지하지 않고 조용히
+    // 닫는다 — 어느 쪽 Promise가 먼저 끝나든 상관없이 항상 "가장 나중에 시작한
+    // 시도"만 승리하게 되어 위의 경쟁 상태 버그를 근본적으로 막는다.
+    latestSessionGeneration = myGeneration;
+    const isSuperseded = () => myGeneration !== latestSessionGeneration;
 
     ai.live
       .connect({
@@ -217,7 +271,9 @@ wss.on("connection", (clientWs) => {
         config: buildLiveConfig(resumptionHandle),
         callbacks: {
           onopen: () => {
-            if (!isReconnect) {
+            if (isSuperseded()) return;
+            if (!hasSentReady) {
+              hasSentReady = true;
               send({ type: "ready" });
             } else {
               console.log("[Gemini] 세션 재연결 완료");
@@ -225,13 +281,12 @@ wss.on("connection", (clientWs) => {
             }
           },
           onmessage: (message) => {
-            lastGeminiMessageAt = Date.now();
             if (message.sessionResumptionUpdate?.resumable && message.sessionResumptionUpdate.newHandle) {
               resumptionHandle = message.sessionResumptionUpdate.newHandle;
             }
             if (message.goAway) {
               console.log("[Gemini] GoAway 수신 (남은 시간:", message.goAway.timeLeft, ") — 백그라운드로 재연결 시도");
-              isCurrentSession = false;
+              lastGeminiMessageAt = Date.now();
               // GoAway는 "지금 끊겨라"가 아니라 "timeLeft 뒤에 끊길 예정"이라는 예고다.
               // 이 세션은 그때까지 계속 정상 작동하므로 liveSession을 여기서 비우지
               // 않는다 — 비우면 새 세션이 열릴 때까지 매번 음성이 통째로 멈춰서
@@ -239,15 +294,21 @@ wss.on("connection", (clientWs) => {
               // 준비된 순간(.then 콜백)에만 liveSession을 갈아타서 끊김 없이 전환한다.
               // 혹시라도 새 세션이 열리기 전에 이 세션이 실제로 죽으면(onclose/onerror),
               // 그때 비로소 liveSession이 비워지고 pendingAudio가 안전망 역할을 한다.
-              connectLive(true);
+              // GoAway로 인한 재연결은 정상적인 예고된 유지보수이지 실패가 아니므로
+              // scheduleReconnect(재시도 횟수 소모)를 거치지 않고 직접 시도한다.
+              connectLive(false);
               return;
             }
             // 더 최신 세대가 이미 응답을 시작했다면, 뒤늦게 도착한 옛 세대의 메시지는
             // 버린다 — 그대로 흘려보내면 두 세션의 오디오가 겹쳐 들린다. 승격은 실제
             // 오디오/텍스트 등 내용이 있는 메시지에서만 일어나게 해서, 내용 없는
             // 부수 메시지(세션 재개 핸들 갱신 등) 때문에 옛 세션이 말을 채 끝내기도
-            // 전에 조기 차단되는 일이 없게 한다.
+            // 전에 조기 차단되는 일이 없게 한다. 이 판정보다 앞서 lastGeminiMessageAt을
+            // 갱신하지 않는 이유: 이미 버려진 옛 세대가 뒤늦게 흘려보내는 메시지 때문에
+            // 워치독 타이머가 리셋되어, 정작 살아있는 최신 세대가 먹통이어도 감지를
+            // 못하게 되는 걸 막기 위함.
             if (myGeneration < activeSessionGeneration) return;
+            lastGeminiMessageAt = Date.now();
             const hasContent =
               !!message.data ||
               !!message.toolCall?.functionCalls?.length ||
@@ -255,14 +316,22 @@ wss.on("connection", (clientWs) => {
               !!message.serverContent?.outputTranscription?.text ||
               !!message.serverContent?.interrupted ||
               !!message.serverContent?.turnComplete;
-            if (hasContent) activeSessionGeneration = myGeneration;
+            if (hasContent) {
+              activeSessionGeneration = myGeneration;
+              // 실제로 대화 내용이 오가고 있다는 확실한 증거이므로, 그동안 쌓였던
+              // 실패 카운트를 리셋한다. 재연결 자체는 "성공"해도 그 뒤로 Gemini가
+              // 계속 아무 내용도 안 보내면 카운트를 리셋하지 않아, 결국
+              // MAX_RECONNECT_ATTEMPTS에 도달해 세션이 무한 "재연결 중..." 상태로
+              // 방치되지 않고 명확하게 종료되도록 한다.
+              reconnectAttempts = 0;
+            }
             // Gemini가 이번 턴을 완결하면 다시 사용자 차례이므로, 사용자가 다음에
             // 말을 시작하기 전까지는(아래 clientWs.on("message")) 워치독을 끈다.
             if (message.serverContent?.turnComplete) awaitingReply = false;
 
             // 함수 호출 응답은 반드시 그 호출을 만든 세션(thisSession) 자신에게 돌려줘야
-            // 한다. 공유 변수 liveSession을 쓰면, 마침 이 시점에 GoAway로 재연결이
-            // 시작돼 liveSession이 비워지거나 다른 세션으로 바뀐 경우 응답이 유실되고,
+            // 한다. 공유 변수 liveSession을 쓰면, 마침 이 시점에 재연결이 시작돼
+            // liveSession이 비워지거나 다른 세션으로 바뀐 경우 응답이 유실되고,
             // Gemini는 그 함수 호출의 응답을 기다리며 멈춰버린다(마무리 단계에서 자주
             // 발생하던 "그 뒤로 안 들리는" 증상의 원인).
             handleGeminiMessage(message, send, (functionResponses) =>
@@ -272,22 +341,30 @@ wss.on("connection", (clientWs) => {
           onerror: (err) => {
             console.error("Gemini Live 오류:", err?.message || err);
             if (liveSession === thisSession) liveSession = null;
-            if (isCurrentSession) send({ type: "error", message: "AI 연결 중 오류가 발생했어요." });
+            // 이미 더 최신 연결 시도로 대체된 세션의 뒤늦은 오류는 무시한다(그 최신
+            // 시도가 알아서 자기 생애주기를 관리한다). 그렇지 않다면(지금 이 세션이
+            // 여전히 "현재" 세션이었다면) 예전처럼 곧바로 전체 세션을 죽이는 대신
+            // 자동 재연결을 시도한다 — 일시적 오류 한 번에 코칭 세션 전체가
+            // 끝나버리지 않도록.
+            if (isSuperseded()) return;
+            scheduleReconnect(`onerror: ${err?.message || err}`);
           },
           onclose: (event) => {
             console.error("Gemini Live 종료:", event?.code, event?.reason);
             // 새 세션으로 이미 넘어갔다면 옛 세션이 뒤늦게 닫혀도 liveSession을 건드리지 않는다.
             if (liveSession === thisSession) liveSession = null;
-            if (!closedByClient && isCurrentSession) {
-              send({ type: "error", message: "AI 연결이 종료됐어요." });
-            }
+            if (closedByClient || isSuperseded()) return;
+            scheduleReconnect(`onclose: ${event?.code} ${event?.reason}`);
           },
         },
       })
       .then((session) => {
         // 연결이 완료되기 전에 클라이언트가 이미 나갔다면 곧바로 정리한다
         // (재연결 도중 사용자가 통화를 끊는 경우, 세션이 안 닫힌 채 남는 걸 방지).
-        if (closedByClient) {
+        // 마찬가지로, 이 세션이 열리는 동안 더 최신 연결 시도가 이미 시작됐다면
+        // (워치독/GoAway가 겹쳐 발동한 경우) 이 세션은 liveSession을 차지하지 않고
+        // 곧바로 닫는다 — 항상 가장 최근에 시작한 시도만 살아남게 한다.
+        if (closedByClient || isSuperseded()) {
           session.close();
           return;
         }
@@ -307,28 +384,12 @@ wss.on("connection", (clientWs) => {
       })
       .catch((err) => {
         console.error("Gemini Live 연결 실패:", err?.message || err);
-        if (closedByClient) return;
-
-        if (isReconnect && retryCount < MAX_RECONNECT_RETRIES) {
-          // 재연결이 한 번 실패했다고 바로 세션을 끊지 않는다. 네트워크 순간 오류일 수
-          // 있으니 짧은 대기 후 몇 차례 더 시도하고, 그동안 들어온 오디오는 계속
-          // pendingAudio에 쌓여 있다가 재연결에 성공하면 그대로 이어서 전달된다.
-          const delayMs = 500 * (retryCount + 1);
-          console.log(`[Gemini] 재연결 재시도 (${retryCount + 1}/${MAX_RECONNECT_RETRIES}, ${delayMs}ms 후)`);
-          setTimeout(() => connectLive(true, retryCount + 1, announce), delayMs);
-          return;
-        }
-
-        if (isReconnect) {
-          send({ type: "error", message: "AI 연결이 끊어져 재연결에 실패했어요. 다시 시작해주세요." });
-        } else {
-          send({ type: "error", message: "AI 연결에 실패했어요. API 키를 확인해주세요." });
-        }
-        clientWs.close();
+        if (closedByClient || isSuperseded()) return;
+        scheduleReconnect(`connect failed: ${err?.message || err}`);
       });
   }
 
-  connectLive(false);
+  connectLive();
 
   clientWs.on("message", (raw) => {
     let msg;
@@ -352,8 +413,10 @@ wss.on("connection", (clientWs) => {
           liveSession.sendRealtimeInput(payload);
         } catch (err) {
           console.error("[Gemini] 오디오 전송 실패, 재연결 대기열에 보관:", err?.message || err);
-          liveSession = null;
           pendingAudio.push(payload);
+          // onerror/onclose가 뒤따라 오지 않을 수도 있으니(예: 이미 죽은 소켓에
+          // 조용히 쓰기 실패), 여기서도 직접 재연결을 걸어 먹통 상태로 방치되지 않게 한다.
+          scheduleReconnect(`sendRealtimeInput 실패: ${err?.message || err}`);
         }
       } else {
         // 재연결 중 (GoAway~새 세션 open 사이). 새 세션이 열리면 순서대로 전달된다.
