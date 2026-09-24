@@ -7,6 +7,9 @@ const micButton = document.getElementById("micButton");
 const statusEl = document.getElementById("status");
 const bodyEl = document.body;
 const finishButton = document.getElementById("finishButton");
+const coachActions = document.getElementById("coachActions");
+const skipToActionButton = document.getElementById("skipToActionButton");
+const endCoachingButton = document.getElementById("endCoachingButton");
 const completionModal = document.getElementById("completionModal");
 const modalCloseButton = document.getElementById("modalCloseButton");
 const consentModal = document.getElementById("consentModal");
@@ -49,30 +52,62 @@ let levelFrame = null;
 
 // 음성 AI는 시간이 얼마나 흘렀는지 스스로 알 수 없어서, 코칭을 너무 서둘러 끝내거나 반대로
 // 끝없이 끌곤 한다. 정해진 시점마다 경과 시간을 (말하지 않는) 시스템 메모로 알려줘서
-// 한 세션이 8~15분 안에 끝나도록 속도를 조절하게 한다.
+// 한 세션이 5~8분(최대 10분) 안에 끝나도록 속도를 조절하게 한다.
 const PACING_NOTES = [
-  { min: 3, hint: "아직 현재 탐색 단계다. 대안이나 실행 계획으로 넘어가지 말고 감정·자기대화·가치를 깊이 탐색한다." },
-  { min: 6, hint: "이제 대안 탐색으로 넘어가도 된다. 고객의 통찰을 확인한 뒤 대안으로 이끈다." },
-  { min: 8, hint: "실행 계획으로 넘어갈 시점이다. 실행 계획과 의지가 확인되면 마무리해도 된다." },
-  { min: 11, hint: "아직 실행 계획 중이라면 핵심(무엇을, 언제, 실행 의지)만 확정하고 마무리로 넘어간다." },
-  { min: 13, hint: "마무리할 시점이다. 오늘 얻은 것을 묻고 응원으로 마무리한다." },
-  { min: 15, hint: "세션 시간이 다 됐다. 지금 바로 마무리한다." },
+  { min: 2, hint: "아직 목표 합의 중이라면 한 문장으로 요약해 확정하고 현재 탐색으로 넘어간다." },
+  { min: 3, hint: "고객의 통찰이 나왔다면 대안 탐색으로 넘어가도 된다. 같은 탐색 질문을 되풀이하지 않는다." },
+  { min: 5, hint: "실행 계획으로 넘어갈 시점이다. 무엇을, 언제, 실행 의지가 확인되면 마무리해도 된다." },
+  { min: 7, hint: "아직 실행 계획 중이라면 핵심(무엇을, 언제)만 확정하고 마무리로 넘어간다." },
+  { min: 8, hint: "마무리할 시점이다. 어느 단계에 있든 오늘 얻은 것을 묻고 응원으로 마무리한다." },
+  { min: 10, hint: "세션 최대 시간이 다 됐다. 새로운 질문 없이 지금 바로 인사하고 마친다." },
 ];
 let pacingTimers = [];
+
+function sendSystemNote(text) {
+  sendEvent({
+    type: "conversation.item.create",
+    item: { type: "message", role: "system", content: [{ type: "input_text", text }] },
+  });
+}
 
 function startPacingNotes() {
   pacingTimers = PACING_NOTES.map(({ min, hint }) =>
     setTimeout(() => {
-      sendEvent({
-        type: "conversation.item.create",
-        item: {
-          type: "message",
-          role: "system",
-          content: [{ type: "input_text", text: `[진행 시간 안내 — 고객에게 말하지 말 것] 코칭 시작 후 약 ${min}분 경과. ${hint}` }],
-        },
-      });
+      sendSystemNote(`[진행 시간 안내 — 고객에게 말하지 말 것] 코칭 시작 후 약 ${min}분 경과. ${hint}`);
     }, min * 60 * 1000)
   );
+}
+
+// 겉도는 질문이 반복돼 지루해진 사람을 위해, 3분쯤부터 "실행으로 넘어가기"와
+// "코칭 종료하기" 버튼을 보여준다. 누르면 고객 요청을 시스템 메모로 알리고 바로 응답하게 한다.
+const COACH_ACTIONS_DELAY_MIN = 3;
+let coachActionsTimer = null;
+let responseActive = false;
+let wrappedUp = false;
+let endingRequested = false;
+
+function showCoachActions() {
+  if (!sessionActive || wrappedUp) return;
+  skipToActionButton.hidden = false;
+  coachActions.hidden = false;
+}
+
+function hideCoachActions() {
+  coachActions.hidden = true;
+}
+
+// 코치가 말하는 중이면 그 말을 끊고, 버튼 요청에 맞는 응답을 바로 시작하게 한다.
+function interruptAndRespond(note) {
+  if (responseActive) sendEvent({ type: "response.cancel" });
+  sendEvent({ type: "output_audio_buffer.clear" });
+  sendSystemNote(note);
+  sendEvent({ type: "response.create" });
+}
+
+function markWrappedUp() {
+  wrappedUp = true;
+  hideCoachActions();
+  finishButton.hidden = false;
 }
 
 function setState(state, message) {
@@ -121,7 +156,7 @@ function handleServerEvent(event) {
     case "response.function_call_arguments.done":
       if (event.name === "mark_coaching_wrap_up") {
         console.log("[멘코] 코칭 마무리 단계 진입 신호 수신");
-        finishButton.hidden = false;
+        markWrappedUp();
       }
       wrapUpCallId = event.call_id;
       sendEvent({
@@ -129,7 +164,14 @@ function handleServerEvent(event) {
         item: { type: "function_call_output", call_id: event.call_id, output: JSON.stringify({ ok: true }) },
       });
       break;
+    case "response.created":
+      responseActive = true;
+      break;
     case "response.done": {
+      responseActive = false;
+      // 코칭 종료 버튼으로 요청한 응원 인사가 끝나면, 모델이 마무리 함수를 부르지 않았더라도
+      // 코칭 완료 버튼을 보여준다.
+      if (endingRequested && event.response?.status === "completed") markWrappedUp();
       // OpenAI 계정의 분당 토큰 한도(TPM)에 걸리면 응답이 실패하고 AI가 그냥 침묵한다.
       // 안내된 대기 시간만큼 기다렸다가 같은 응답을 다시 요청한다.
       const error = event.response?.status_details?.error;
@@ -217,6 +259,7 @@ async function startSession() {
 
   startMicLevelMeter(micStream);
   startPacingNotes();
+  coachActionsTimer = setTimeout(showCoachActions, COACH_ACTIONS_DELAY_MIN * 60 * 1000);
   setState("listening", "듣고 있어요...");
 }
 
@@ -241,6 +284,12 @@ function endSession(message = "버튼을 누르고 멘탈 코칭 대화를 시�
   }
   remoteAudio = null;
   wrapUpCallId = null;
+  clearTimeout(coachActionsTimer);
+  coachActionsTimer = null;
+  responseActive = false;
+  wrappedUp = false;
+  endingRequested = false;
+  hideCoachActions();
   finishButton.hidden = true;
   setState(null, message);
 }
@@ -262,6 +311,30 @@ micButton.addEventListener("click", () => {
     const denied = err?.name === "NotAllowedError";
     endSession(denied ? "마이크 접근이 거부됐어요." : err?.message || "연결에 실패했어요.");
   });
+});
+
+skipToActionButton.addEventListener("click", () => {
+  skipToActionButton.hidden = true;
+  interruptAndRespond(
+    "[고객 버튼 요청 — 실행으로 넘어가기] 고객이 탐색은 충분하니 바로 실행으로 넘어가길 원한다. " +
+      "지금 하던 질문을 멈추고, 지금까지 나온 고객의 이야기를 한 문장으로 짧게 요약한 뒤 곧바로 " +
+      "6단계(실행 계획과 의지)의 첫 질문으로 '무엇을, 언제' 해볼지 묻는다. " +
+      "이후에는 현재 탐색·의식 확장·대안 탐색 질문으로 돌아가지 않고, 실행이 확인되면 마무리한다. " +
+      "버튼이나 이 안내를 언급하지 않는다."
+  );
+});
+
+endCoachingButton.addEventListener("click", () => {
+  hideCoachActions();
+  endingRequested = true;
+  pacingTimers.forEach(clearTimeout);
+  pacingTimers = [];
+  interruptAndRespond(
+    "[고객 버튼 요청 — 코칭 종료하기] 고객이 지금 코칭을 마치길 원한다. 새로운 질문은 하지 않는다. " +
+      "오늘 나눈 이야기 속에서 고객이 보여준 용기와 통찰을 구체적으로 인정하고, 진심 어린 격려와 응원으로 " +
+      "2~3문장 안에 따뜻하게 인사하며 마친다. 이때 mark_coaching_wrap_up 함수를 한 번 호출한다. " +
+      "버튼이나 이 안내를 언급하지 않는다."
+  );
 });
 
 finishButton.addEventListener("click", () => {

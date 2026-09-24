@@ -176,6 +176,17 @@
   .finish-btn:hover { background: rgba(242, 242, 247, 0.16); }
   .finish-btn[hidden] { display: none; }
 
+  .coach-actions {
+    margin-top: -12px;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 10px;
+    padding: 0 16px;
+  }
+  .coach-actions[hidden] { display: none; }
+  .coach-actions .finish-btn { margin-top: 0; }
+
   .modal-overlay {
     position: fixed;
     inset: 0;
@@ -364,6 +375,11 @@
   </div>
 
   <div class="status" id="status">버튼을 누르고 멘탈 코칭 대화를 시작해 보세요</div>
+
+  <div id="coachActions" class="coach-actions" hidden>
+    <button id="skipToActionButton" class="finish-btn">실행으로 넘어가기</button>
+    <button id="endCoachingButton" class="finish-btn">코칭 종료하기</button>
+  </div>
 
   <button id="finishButton" class="finish-btn" hidden>코칭 완료</button>
 
